@@ -60,6 +60,8 @@ interface Container {
   expires_at: string;
   owner_username: string;
   created_at: string;
+  share_approvers?: { user_id: number; username: string; approved: boolean; approved_at?: string | null }[] | null;
+  pending_lease_days?: number | null;
 }
 
 async function copyAndFeedback(text: string, button: HTMLButtonElement) {
@@ -158,7 +160,13 @@ export default function MyContainers() {
     );
   };
 
-  const statusText = (s: string) => (s === "running" ? "运行中" : s === "stopped" ? "已停止" : "已清理");
+  const statusText = (s: string) => {
+    if (s === "running") return "运行中";
+    if (s === "pending_share_approval") return "待使用者同意";
+    if (s === "share_rejected") return "共用申请被拒绝";
+    if (s === "stopped") return "已停止";
+    return "已清理";
+  };
 
   if (loading) return <div className="loading">加载中...</div>;
   if (error) return <div className="my-error">加载失败: {error}</div>;
@@ -217,6 +225,20 @@ export default function MyContainers() {
                     ) : "-"}
                   </td>
                   <td className="col-actions">
+                    {c.status === "pending_share_approval" && (
+                      <div style={{ minWidth: 220, textAlign: "left", lineHeight: 1.7 }}>
+                        <div><strong>审批进度：</strong></div>
+                        {(c.share_approvers && c.share_approvers.length > 0) ? (
+                          c.share_approvers.map((a) => (
+                            <div key={`${c.id}-${a.user_id}`}>
+                              {a.username}：{a.approved ? "已同意" : "待同意"}
+                            </div>
+                          ))
+                        ) : (
+                          <div>暂无审批人信息</div>
+                        )}
+                      </div>
+                    )}
                     {c.status === "running" && c.extra_ports?.["8080"] && (
                       <button
                         type="button"

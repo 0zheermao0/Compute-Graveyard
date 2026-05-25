@@ -1,7 +1,7 @@
 """Pydantic 请求/响应模型"""
 from datetime import datetime
 from typing import List, Optional
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class UserBase(BaseModel):
@@ -110,6 +110,14 @@ class UsageRankItem(BaseModel):
     total_hours: float
 
 
+class GPUSharingStatus(BaseModel):
+    """单卡共用占用情况（用于申请页展示全部 GPU）"""
+    gpu_index: int
+    occupant_count: int  # 当前该卡上不同用户数（运行中容器）
+    max_sharing: int  # 管理员配置的单卡最多共用人数上限
+    selectable: bool  # 是否仍可选择（未满员）
+
+
 class DashboardResponse(BaseModel):
     gpus: List[GPUInfo]
     system_load: SystemLoad
@@ -117,6 +125,8 @@ class DashboardResponse(BaseModel):
     all_containers: List[RunningContainerContact]
     weekly_ranking: List[UsageRankItem]
     monthly_ranking: List[UsageRankItem]
+    gpu_sharing: List[GPUSharingStatus] = Field(default_factory=list)
+    max_gpu_sharing_users: int = 4  # 与 gpu_sharing 中 max_sharing 一致，便于前端单独展示
 
 
 class ContainerApplyRequest(BaseModel):
@@ -125,21 +135,35 @@ class ContainerApplyRequest(BaseModel):
     lease_days: int = 3
 
 
+class ShareApproverInfo(BaseModel):
+    user_id: int
+    username: str
+    approved: bool
+    approved_at: Optional[datetime] = None
+
+
 class ContainerResponse(BaseModel):
     id: int
     name: str
     container_id: Optional[str]
     gpu_ids: str  # 空表示纯 CPU
-    ssh_port: int
+    ssh_port: int  # 待审批时尚未分配时为 0
     ssh_password: Optional[str] = None
     extra_ports: Optional[dict] = None  # {容器端口: 宿主机端口}，如 {"8888":30123,"6006":30124}
     status: str
     expires_at: datetime
     owner_username: str
     created_at: datetime
+    # 以下为 GPU 共用审批（仅 pending_share_approval 时有意义）
+    share_approvers: Optional[List[ShareApproverInfo]] = None
+    pending_lease_days: Optional[int] = None
 
-    class Config:
-        from_attributes = True
+
+class ContainerApplyResult(BaseModel):
+    """申请接口返回：立即创建成功或进入待审批"""
+    container: ContainerResponse
+    pending_share_approval: bool = False
+    message: Optional[str] = None
 
 
 class LeaseRenewRequest(BaseModel):
@@ -150,3 +174,19 @@ class NotifyRequest(BaseModel):
     webhook_url: Optional[str] = None
     notify_12h: bool = True
     notify_2h: bool = True
+
+
+class NotificationItem(BaseModel):
+    id: str
+    type: str  # share_approval_request | lease_renew_reminder_1d | share_waiting_for_others
+    title: str
+    message: str
+    created_at: datetime
+    container_id: Optional[int] = None
+    container_name: Optional[str] = None
+    gpu_ids: Optional[str] = None
+
+
+class NotificationListResponse(BaseModel):
+    unread_count: int
+    items: List[NotificationItem]

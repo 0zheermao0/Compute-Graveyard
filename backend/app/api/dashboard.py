@@ -7,14 +7,17 @@ from app.auth import get_current_user
 from app.database import get_db
 from app.database_models import ContainerModel, UserModel
 from app.docker_service import get_gpu_info, get_system_load
+from app.database import get_setting
 from app.models import (
     DashboardResponse,
     GPUInfo,
+    GPUSharingStatus,
     SystemLoad,
     ContainerOccupancy,
     RunningContainerContact,
     UsageRankItem,
 )
+from app.config import DEFAULT_MAX_GPU_SHARING_USERS
 from datetime import datetime, timedelta
 
 router = APIRouter()
@@ -28,6 +31,19 @@ def _container_duration_hours(c: ContainerModel, now: datetime) -> float:
         return 0.0
     delta = end - start
     return max(0, delta.total_seconds() / 3600)
+
+
+def _distinct_users_per_gpu(db) -> dict:
+    """gpu_index -> set of user_id（仅统计运行中且占用该卡的容器）"""
+    from collections import defaultdict
+
+    m = defaultdict(set)
+    for c in db.query(ContainerModel).filter(ContainerModel.status == "running").all():
+        if not c.gpu_ids:
+            continue
+        for gid in map(int, c.gpu_ids.split(",")):
+            m[gid].add(c.user_id)
+    return m
 
 
 def _compute_ranking(db, since: datetime) -> list:
@@ -107,6 +123,24 @@ def get_dashboard(db=Depends(get_db), _=Depends(get_current_user)):
     weekly = _compute_ranking(db, now - timedelta(days=7))
     monthly = _compute_ranking(db, now - timedelta(days=30))
 
+    max_share = int(get_setting("max_gpu_sharing_users", str(DEFAULT_MAX_GPU_SHARING_USERS)))
+    if max_share < 1:
+        max_share = DEFAULT_MAX_GPU_SHARING_USERS
+
+    users_per_gpu = _distinct_users_per_gpu(db)
+    gpu_sharing_list: list[GPUSharingStatus] = []
+    for g in gpu_rows or []:
+        idx = int(g["index"])
+        occ = len(users_per_gpu.get(idx, set()))
+        gpu_sharing_list.append(
+            GPUSharingStatus(
+                gpu_index=idx,
+                occupant_count=occ,
+                max_sharing=max_share,
+                selectable=occ < max_share,
+            )
+        )
+
     return DashboardResponse(
         gpus=gpus,
         system_load=system_load,
@@ -114,4 +148,6 @@ def get_dashboard(db=Depends(get_db), _=Depends(get_current_user)):
         all_containers=all_containers,
         weekly_ranking=weekly,
         monthly_ranking=monthly,
+        gpu_sharing=gpu_sharing_list,
+        max_gpu_sharing_users=max_share,
     )

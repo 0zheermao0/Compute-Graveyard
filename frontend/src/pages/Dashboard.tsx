@@ -49,6 +49,13 @@ interface UsageRankItem {
   total_hours: number;
 }
 
+interface GpuSharingStatus {
+  gpu_index: number;
+  occupant_count: number;
+  max_sharing: number;
+  selectable: boolean;
+}
+
 interface DashboardData {
   gpus: GPUInfo[];
   system_load: {
@@ -63,6 +70,8 @@ interface DashboardData {
   all_containers: RunningContainer[];
   weekly_ranking: UsageRankItem[];
   monthly_ranking: UsageRankItem[];
+  gpu_sharing?: GpuSharingStatus[];
+  max_gpu_sharing_users?: number;
 }
 
 export default function Dashboard() {
@@ -78,6 +87,7 @@ export default function Dashboard() {
         ...d,
         weekly_ranking: d.weekly_ranking ?? [],
         monthly_ranking: d.monthly_ranking ?? [],
+        gpu_sharing: d.gpu_sharing ?? [],
       });
       setError("");
     } catch (e) {
@@ -91,7 +101,6 @@ export default function Dashboard() {
     return () => clearInterval(id);
   }, []);
 
-  const occupiedSet = new Set((data?.occupancies ?? []).map((o) => o.gpu_index));
   const ranking = rankMode === "weekly" ? (data?.weekly_ranking ?? []) : (data?.monthly_ranking ?? []);
 
   if (error && !data) {
@@ -216,7 +225,7 @@ export default function Dashboard() {
 
       {showApply && (
         <ApplyModal
-          freeGpus={data?.gpus?.filter((g) => !occupiedSet.has(g.index)).map((g) => g.index) ?? []}
+          gpuSharing={data?.gpu_sharing ?? []}
           onClose={() => setShowApply(false)}
           onSuccess={() => {
             setShowApply(false);

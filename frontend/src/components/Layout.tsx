@@ -3,7 +3,8 @@ import { Outlet, Link, useLocation, useNavigate } from "react-router-dom";
 import "./Layout.css";
 import { useAuth } from "../hooks/useAuth";
 import InstructionModal from "./InstructionModal";
-import { HelpCircle } from "lucide-react";
+import { Bell, HelpCircle } from "lucide-react";
+import { fetcher } from "../api/client";
 
 const SLOGANS = [
   "正在消耗 GPU 的寿命，换取一份无法收敛的 Loss。",
@@ -34,10 +35,25 @@ export default function Layout() {
   const navigate = useNavigate();
   const [sloganIndex, setSloganIndex] = useState(0);
   const [showInstructions, setShowInstructions] = useState(false);
+  const [unreadCount, setUnreadCount] = useState(0);
 
   useEffect(() => {
     const t = setInterval(() => setSloganIndex((i) => (i + 1) % SLOGANS.length), 10000);
     return () => clearInterval(t);
+  }, []);
+
+  useEffect(() => {
+    const loadCount = async () => {
+      try {
+        const data = await fetcher<{ unread_count: number }>("/containers/notifications");
+        setUnreadCount(data.unread_count || 0);
+      } catch {
+        setUnreadCount(0);
+      }
+    };
+    loadCount();
+    const id = setInterval(loadCount, 15000);
+    return () => clearInterval(id);
   }, []);
 
   const handleLogout = () => {
@@ -49,6 +65,7 @@ export default function Layout() {
     { to: "/", label: "资源看板" },
     { to: "/my", label: "我的容器" },
     { to: "/workspace", label: "工作区" },
+    { to: "/notifications", label: "通知" },
     { to: "/profile", label: "个人资料" },
     ...(user?.role === "admin" ? [{ to: "/admin", label: "管理" }] : []),
   ];
@@ -159,6 +176,9 @@ export default function Layout() {
           说明
         </button>
         <div className="layout-mobile-actions">
+          <Link to="/notifications" className="btn btn-ghost" style={{ padding: "0.35rem 0.6rem", fontSize: "0.85rem", marginRight: "0.5rem" }}>
+            通知{unreadCount > 0 ? `(${unreadCount > 99 ? "99+" : unreadCount})` : ""}
+          </Link>
           <button onClick={handleLogout} className="btn btn-ghost" style={{ padding: "0.35rem 0.6rem", fontSize: "0.85rem" }}>
             退出
           </button>
@@ -172,6 +192,10 @@ export default function Layout() {
             <p className="header-slogan" title="Stochastic Noise">
               {SLOGANS[sloganIndex]}
             </p>
+            <Link to="/notifications" className="header-bell" title="通知中心">
+              <Bell size={18} />
+              {unreadCount > 0 && <span className="header-bell-badge">{unreadCount > 99 ? "99+" : unreadCount}</span>}
+            </Link>
             <Link to="/profile" className="header-user-link" title="个人资料">
               {user?.display_name || user?.username}
             </Link>

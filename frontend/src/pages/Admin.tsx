@@ -38,6 +38,7 @@ interface Container {
 interface SystemSettings {
   cpu_mem_gb: number;
   gpu_mem_gb_per_gpu: number;
+  max_gpu_sharing_users: number;
 }
 
 // ---- 通知组件 ----
@@ -103,8 +104,8 @@ export default function Admin() {
   const [createError, setCreateError] = useState("");
 
   // 资源配额
-  const [settings, setSettings] = useState<SystemSettings>({ cpu_mem_gb: 8, gpu_mem_gb_per_gpu: 32 });
-  const [settingsDraft, setSettingsDraft] = useState<SystemSettings>({ cpu_mem_gb: 8, gpu_mem_gb_per_gpu: 32 });
+  const [settings, setSettings] = useState<SystemSettings>({ cpu_mem_gb: 8, gpu_mem_gb_per_gpu: 32, max_gpu_sharing_users: 4 });
+  const [settingsDraft, setSettingsDraft] = useState<SystemSettings>({ cpu_mem_gb: 8, gpu_mem_gb_per_gpu: 32, max_gpu_sharing_users: 4 });
   const [settingsSaving, setSettingsSaving] = useState(false);
 
   // toast 通知
@@ -290,6 +291,22 @@ export default function Admin() {
               <div>选 1 张 GPU → <b>{settingsDraft.gpu_mem_gb_per_gpu} GB</b></div>
               <div>选 2 张 GPU → <b>{settingsDraft.gpu_mem_gb_per_gpu * 2} GB</b></div>
               <div>选 4 张 GPU → <b>{settingsDraft.gpu_mem_gb_per_gpu * 4} GB</b></div>
+            </div>
+          </div>
+          <div className="setting-item">
+            <label>
+              <strong>单卡最多共用人数</strong>
+              <span className="setting-desc">同一块 GPU 上允许并行使用的不同用户上限</span>
+            </label>
+            <div className="setting-input-wrap">
+              <input
+                type="number"
+                min={1}
+                max={20}
+                value={settingsDraft.max_gpu_sharing_users}
+                onChange={(e) => setSettingsDraft(s => ({ ...s, max_gpu_sharing_users: Number(e.target.value) }))}
+              />
+              <span>人 / 卡</span>
             </div>
           </div>
           <div className="setting-item setting-item-action">

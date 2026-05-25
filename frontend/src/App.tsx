@@ -8,6 +8,7 @@ import MyContainers from "./pages/MyContainers";
 import Workspace from "./pages/Workspace";
 import Profile from "./pages/Profile";
 import Admin from "./pages/Admin";
+import Notifications from "./pages/Notifications";
 
 function LoadingScreen() {
   return (
@@ -48,6 +49,7 @@ export default function App() {
         <Route index element={<Dashboard />} />
         <Route path="my" element={<MyContainers />} />
         <Route path="workspace" element={<Workspace />} />
+        <Route path="notifications" element={<Notifications />} />
         <Route path="profile" element={<Profile />} />
         <Route
           path="admin"

@@ -33,10 +33,12 @@ class ContainerModel(Base):
     ssh_port = Column(Integer, nullable=False)
     extra_ports = Column(String(256), nullable=True)  # JSON: {"8888":30123,"6006":30124,"8080":30125}
     ssh_password = Column(String(64), nullable=True)  # 随机生成，仅容器拥有者可见
-    status = Column(String(16), default="running")  # running | stopped | removed
+    status = Column(String(16), default="running")  # running | stopped | removed | pending_share_approval | share_rejected
     expires_at = Column(DateTime, nullable=False)
     stopped_at = Column(DateTime)  # 停止时间，用于 24h 后清理
     created_at = Column(DateTime, default=datetime.now)
+    # GPU 共用审批：pending_share_json 存 JSON（lease_days、approvers 等），仅在 status=pending_share_approval 时有值
+    pending_share_json = Column(Text, nullable=True)
     owner = relationship("UserModel", back_populates="containers")
     lease_records = relationship("LeaseRecordModel", back_populates="container")
 

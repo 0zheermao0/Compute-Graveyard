@@ -230,6 +230,40 @@
   border-radius: var(--radius-md);
 }
 
+.header-bell {
+  position: relative;
+  width: 34px;
+  height: 34px;
+  border-radius: 999px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: #e4e4e7;
+  background: rgba(255, 255, 255, 0.06);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+}
+
+.header-bell:hover {
+  color: #34d399;
+  text-decoration: none;
+}
+
+.header-bell-badge {
+  position: absolute;
+  top: -6px;
+  right: -8px;
+  min-width: 18px;
+  height: 18px;
+  border-radius: 999px;
+  background: #ef4444;
+  color: #fff;
+  font-size: 0.7rem;
+  line-height: 18px;
+  text-align: center;
+  padding: 0 4px;
+  border: 1px solid rgba(0, 0, 0, 0.35);
+}
+
 .main {
   flex: 1;
   padding: 1rem 1.25rem;

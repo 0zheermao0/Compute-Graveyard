@@ -9,7 +9,7 @@ from app.database_models import UserModel, ContainerModel
 from app.docker_service import stop_container, remove_container
 from app.models import UserCreate, UserResponse
 from app.auth import get_password_hash
-from app.config import DEFAULT_CPU_MEM_GB, DEFAULT_GPU_MEM_GB_PER_GPU
+from app.config import DEFAULT_CPU_MEM_GB, DEFAULT_GPU_MEM_GB_PER_GPU, DEFAULT_MAX_GPU_SHARING_USERS
 
 router = APIRouter()
 
@@ -181,12 +181,14 @@ def get_settings(admin=Depends(get_current_admin)):
     return {
         "cpu_mem_gb": int(get_setting("cpu_mem_gb", str(DEFAULT_CPU_MEM_GB))),
         "gpu_mem_gb_per_gpu": int(get_setting("gpu_mem_gb_per_gpu", str(DEFAULT_GPU_MEM_GB_PER_GPU))),
+        "max_gpu_sharing_users": int(get_setting("max_gpu_sharing_users", str(DEFAULT_MAX_GPU_SHARING_USERS))),
     }
 
 
 class SettingsUpdate(BaseModel):
     cpu_mem_gb: int
     gpu_mem_gb_per_gpu: int
+    max_gpu_sharing_users: int
 
 
 @router.put("/settings")
@@ -195,6 +197,9 @@ def update_settings(req: SettingsUpdate, admin=Depends(get_current_admin)):
         raise HTTPException(status_code=400, detail="CPU 内存配额最小 1 GB")
     if req.gpu_mem_gb_per_gpu < 1:
         raise HTTPException(status_code=400, detail="单卡 GPU 内存配额最小 1 GB")
+    if req.max_gpu_sharing_users < 1:
+        raise HTTPException(status_code=400, detail="单卡最多共用人数至少为 1")
     set_setting("cpu_mem_gb", str(req.cpu_mem_gb))
     set_setting("gpu_mem_gb_per_gpu", str(req.gpu_mem_gb_per_gpu))
+    set_setting("max_gpu_sharing_users", str(req.max_gpu_sharing_users))
     return {"message": "配置已保存"}

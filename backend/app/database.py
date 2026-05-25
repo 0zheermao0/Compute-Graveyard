@@ -35,6 +35,17 @@ def init_db():
     _migrate_user_approval()
     _migrate_container_timestamps()
     _migrate_system_settings()
+    _migrate_pending_share_json()
+
+
+def _migrate_pending_share_json():
+    from sqlalchemy import text
+    try:
+        with engine.connect() as conn:
+            conn.execute(text("ALTER TABLE containers ADD COLUMN pending_share_json TEXT"))
+            conn.commit()
+    except Exception:
+        pass
 
 
 def _migrate_add_ssh_password():
