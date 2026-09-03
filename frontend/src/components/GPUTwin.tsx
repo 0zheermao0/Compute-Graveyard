@@ -6,11 +6,11 @@ import "./GPUTwin.css";
 export interface GPUInfo {
   index: number;
   name: string;
-  memory_used_mb: number;
-  memory_total_mb: number;
-  memory_percent: number;
-  temperature?: number;
-  utilization?: number;
+  memory_used_mb: number | null;
+  memory_total_mb: number | null;
+  memory_percent: number | null;
+  temperature?: number | null;
+  utilization?: number | null;
 }
 
 export interface Occupancy {
@@ -42,7 +42,7 @@ interface TwinGPUData {
 function buildTwinData(gpus: GPUInfo[], occupancies: Occupancy[]): TwinGPUData[] {
   return gpus.map((gpu) => {
     const occ = occupancies.find((o) => o.gpu_index === gpu.index);
-    const util = gpu.utilization ?? gpu.memory_percent;
+    const util = gpu.utilization ?? gpu.memory_percent ?? 0;
     const power = Math.round((util / 100) * 350);
     const contactInfo = occ?.contact_value
       ? `(${occ.contact_type === "wechat" ? "微信" : "手机"}: ${occ.contact_value})`
@@ -57,7 +57,7 @@ function buildTwinData(gpus: GPUInfo[], occupancies: Occupancy[]): TwinGPUData[]
       isOccupied: !!occ,
       uptime: occ?.duration_hours != null ? `${occ.duration_hours}h` : "-",
       temp: gpu.temperature ?? 0,
-      memoryPercent: gpu.memory_percent,
+      memoryPercent: gpu.memory_percent ?? 0,
     };
   });
 }

@@ -7,11 +7,11 @@ import "./Dashboard.css";
 interface GPUInfo {
   index: number;
   name: string;
-  memory_used_mb: number;
-  memory_total_mb: number;
-  memory_percent: number;
-  temperature?: number;
-  utilization?: number;
+  memory_used_mb: number | null;
+  memory_total_mb: number | null;
+  memory_percent: number | null;
+  temperature?: number | null;
+  utilization?: number | null;
 }
 
 interface Occupancy {

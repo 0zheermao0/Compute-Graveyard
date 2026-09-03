@@ -4,12 +4,13 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
 from app.auth import get_current_admin
-from app.database import get_db, get_setting, set_setting
-from app.database_models import UserModel, ContainerModel
-from app.docker_service import stop_container, remove_container
+from app.database import get_db
+from app.database_models import UserModel, ContainerModel, LeaseRecordModel
+from app.docker_service import stop_container
 from app.models import UserCreate, UserResponse
 from app.auth import get_password_hash
-from app.config import DEFAULT_CPU_MEM_GB, DEFAULT_GPU_MEM_GB_PER_GPU, DEFAULT_MAX_GPU_SHARING_USERS
+from app.container_lifecycle import remove_container_record
+from app.settings_service import SettingsValues, load_settings, save_settings
 
 router = APIRouter()
 
@@ -91,22 +92,22 @@ def delete_user(user_id: int, admin=Depends(get_current_admin), db=Depends(get_d
     u = db.query(UserModel).filter(UserModel.id == user_id).first()
     if not u:
         raise HTTPException(status_code=404, detail="用户不存在")
-    
+
     if u.role == "admin":
         # 防止自杀或删除其他管理员（可根据需求调整）
         raise HTTPException(status_code=400, detail="不能在管理后台删除管理员账号")
 
-    # 先清理该用户的所有容器
     containers = db.query(ContainerModel).filter(ContainerModel.user_id == user_id).all()
     for c in containers:
-        if c.container_id:
-            try:
-                stop_container(c.container_id)
-                remove_container(c.container_id)
-            except:
-                pass
+        if c.status != "removed" and c.container_id:
+            result = remove_container_record(db, c, "管理员删除用户")
+            if not result.success:
+                raise HTTPException(status_code=500, detail=f"容器 {c.name} 销毁失败: {result.error or '未知错误'}")
+        elif c.status not in {"removed", "pending_share_approval", "share_rejected"}:
+            raise HTTPException(status_code=500, detail=f"容器 {c.name} 缺少 Docker ID，无法确认资源已清理")
+        db.query(LeaseRecordModel).filter(LeaseRecordModel.container_id == c.id).delete(synchronize_session=False)
         db.delete(c)
-    
+
     db.delete(u)
     db.commit()
     return {"message": "用户及其关联资源已成功删除"}
@@ -131,23 +132,11 @@ def force_remove(container_id: int, admin=Depends(get_current_admin), db=Depends
     c = db.query(ContainerModel).filter(ContainerModel.id == container_id).first()
     if not c:
         raise HTTPException(status_code=404, detail="容器不存在")
-    if c.container_id:
-        try:
-            stop_container(c.container_id)
-            remove_container(c.container_id)
-        except:
-            pass
-    
-    from datetime import datetime
-    now = datetime.now()
-    c.status = "removed"
-    # 如果之前没停过，记录当前时间为停止时间
-    if not c.stopped_at:
-        c.stopped_at = now
-    # 为避免重名冲突，给旧名称加个时间戳后缀
-    c.name = f"{c.name}-del-{int(now.timestamp())}"
-    c.container_id = None
-    db.commit()
+    if c.status == "removed" and not c.container_id:
+        return {"message": "容器已清理并存档"}
+    result = remove_container_record(db, c, "管理员强制清理")
+    if not result.success:
+        raise HTTPException(status_code=500, detail=f"容器销毁失败: {result.error or '未知错误'}")
     return {"message": "已成功强制清理容器并存档记录"}
 
 
@@ -177,29 +166,37 @@ def list_all_containers(admin=Depends(get_current_admin), db=Depends(get_db)):
 # ---- 资源配额设置 ----
 
 @router.get("/settings")
-def get_settings(admin=Depends(get_current_admin)):
-    return {
-        "cpu_mem_gb": int(get_setting("cpu_mem_gb", str(DEFAULT_CPU_MEM_GB))),
-        "gpu_mem_gb_per_gpu": int(get_setting("gpu_mem_gb_per_gpu", str(DEFAULT_GPU_MEM_GB_PER_GPU))),
-        "max_gpu_sharing_users": int(get_setting("max_gpu_sharing_users", str(DEFAULT_MAX_GPU_SHARING_USERS))),
-    }
+def get_settings(admin=Depends(get_current_admin), db=Depends(get_db)):
+    try:
+        return load_settings(db)
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=500, detail=f"系统设置无效: {exc}") from exc
 
 
 class SettingsUpdate(BaseModel):
     cpu_mem_gb: int
     gpu_mem_gb_per_gpu: int
     max_gpu_sharing_users: int
+    idle_gpu_reclaim_enabled: bool
+    idle_gpu_util_threshold_percent: int
+    idle_gpu_memory_threshold_percent: int
+    idle_gpu_duration_hours: int
+
+
+def _model_values(model: BaseModel) -> dict:
+    if hasattr(model, "model_dump"):
+        return model.model_dump()
+    return model.dict()
 
 
 @router.put("/settings")
-def update_settings(req: SettingsUpdate, admin=Depends(get_current_admin)):
-    if req.cpu_mem_gb < 1:
-        raise HTTPException(status_code=400, detail="CPU 内存配额最小 1 GB")
-    if req.gpu_mem_gb_per_gpu < 1:
-        raise HTTPException(status_code=400, detail="单卡 GPU 内存配额最小 1 GB")
-    if req.max_gpu_sharing_users < 1:
-        raise HTTPException(status_code=400, detail="单卡最多共用人数至少为 1")
-    set_setting("cpu_mem_gb", str(req.cpu_mem_gb))
-    set_setting("gpu_mem_gb_per_gpu", str(req.gpu_mem_gb_per_gpu))
-    set_setting("max_gpu_sharing_users", str(req.max_gpu_sharing_users))
-    return {"message": "配置已保存"}
+def update_settings(req: SettingsUpdate, admin=Depends(get_current_admin), db=Depends(get_db)):
+    values = SettingsValues(**_model_values(req))
+    try:
+        return save_settings(db, values)
+    except ValueError as exc:
+        db.rollback()
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception:
+        db.rollback()
+        raise

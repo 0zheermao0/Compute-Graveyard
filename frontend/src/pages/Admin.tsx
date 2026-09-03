@@ -39,7 +39,21 @@ interface SystemSettings {
   cpu_mem_gb: number;
   gpu_mem_gb_per_gpu: number;
   max_gpu_sharing_users: number;
+  idle_gpu_reclaim_enabled: boolean;
+  idle_gpu_util_threshold_percent: number;
+  idle_gpu_memory_threshold_percent: number;
+  idle_gpu_duration_hours: number;
 }
+
+const defaultSettings: SystemSettings = {
+  cpu_mem_gb: 8,
+  gpu_mem_gb_per_gpu: 32,
+  max_gpu_sharing_users: 4,
+  idle_gpu_reclaim_enabled: true,
+  idle_gpu_util_threshold_percent: 5,
+  idle_gpu_memory_threshold_percent: 5,
+  idle_gpu_duration_hours: 24,
+};
 
 // ---- 通知组件 ----
 type ToastType = "success" | "error" | "info";
@@ -104,9 +118,11 @@ export default function Admin() {
   const [createError, setCreateError] = useState("");
 
   // 资源配额
-  const [settings, setSettings] = useState<SystemSettings>({ cpu_mem_gb: 8, gpu_mem_gb_per_gpu: 32, max_gpu_sharing_users: 4 });
-  const [settingsDraft, setSettingsDraft] = useState<SystemSettings>({ cpu_mem_gb: 8, gpu_mem_gb_per_gpu: 32, max_gpu_sharing_users: 4 });
+  const [settings, setSettings] = useState<SystemSettings>(defaultSettings);
+  const [settingsDraft, setSettingsDraft] = useState<SystemSettings>(defaultSettings);
   const [settingsSaving, setSettingsSaving] = useState(false);
+  const [settingsLoaded, setSettingsLoaded] = useState(false);
+  const [settingsError, setSettingsError] = useState("");
 
   // toast 通知
   const [toasts, setToasts] = useState<ToastMsg[]>([]);
@@ -139,12 +155,17 @@ export default function Admin() {
   };
 
   const loadSettings = async () => {
+    setSettingsError("");
     try {
       const data = await fetcher<SystemSettings>("/admin/settings");
       setSettings(data);
       setSettingsDraft(data);
-    } catch {
-      // 忽略
+      setSettingsLoaded(true);
+    } catch (e) {
+      const message = e instanceof Error ? e.message : "系统设置加载失败";
+      setSettingsLoaded(false);
+      setSettingsError(message);
+      pushToast(message, "error");
     }
   };
 
@@ -224,14 +245,19 @@ export default function Admin() {
 
   const handleSaveSettings = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (!settingsLoaded) {
+      pushToast("系统设置尚未成功加载，已阻止保存", "error");
+      return;
+    }
     setSettingsSaving(true);
     try {
-      await fetcher("/admin/settings", {
+      const saved = await fetcher<SystemSettings>("/admin/settings", {
         method: "PUT",
         body: JSON.stringify(settingsDraft),
       });
-      setSettings(settingsDraft);
-      pushToast("资源配额已保存", "success");
+      setSettings(saved);
+      setSettingsDraft(saved);
+      pushToast("系统设置已保存", "success");
     } catch (e) {
       pushToast(e instanceof Error ? e.message : "保存失败", "error");
     } finally {
@@ -309,15 +335,63 @@ export default function Admin() {
               <span>人 / 卡</span>
             </div>
           </div>
+          <div className="setting-group-title">GPU 低利用自动回收</div>
+          <div className="setting-item setting-item-wide">
+            <label className="setting-toggle-row">
+              <span>
+                <strong>启用自动回收</strong>
+                <span className="setting-desc">达到连续低利用条件后立即停止并销毁 Docker 容器，宿主机 /workspace 保留</span>
+              </span>
+              <input
+                type="checkbox"
+                checked={settingsDraft.idle_gpu_reclaim_enabled}
+                onChange={(e) => setSettingsDraft(s => ({ ...s, idle_gpu_reclaim_enabled: e.target.checked }))}
+              />
+            </label>
+          </div>
+          <div className="setting-item">
+            <label>
+              <strong>GPU 利用率阈值</strong>
+              <span className="setting-desc">整张物理卡利用率必须严格低于该值</span>
+            </label>
+            <div className="setting-input-wrap">
+              <input type="number" min={0} max={100} disabled={!settingsDraft.idle_gpu_reclaim_enabled} value={settingsDraft.idle_gpu_util_threshold_percent} onChange={(e) => setSettingsDraft(s => ({ ...s, idle_gpu_util_threshold_percent: Number(e.target.value) }))} />
+              <span>%</span>
+            </div>
+          </div>
+          <div className="setting-item">
+            <label>
+              <strong>显存占用阈值</strong>
+              <span className="setting-desc">整张物理卡显存占用必须严格低于该值</span>
+            </label>
+            <div className="setting-input-wrap">
+              <input type="number" min={0} max={100} disabled={!settingsDraft.idle_gpu_reclaim_enabled} value={settingsDraft.idle_gpu_memory_threshold_percent} onChange={(e) => setSettingsDraft(s => ({ ...s, idle_gpu_memory_threshold_percent: Number(e.target.value) }))} />
+              <span>%</span>
+            </div>
+          </div>
+          <div className="setting-item">
+            <label>
+              <strong>连续低利用时长</strong>
+              <span className="setting-desc">多 GPU 容器的全部所选 GPU 必须同时持续低于两个阈值</span>
+            </label>
+            <div className="setting-input-wrap">
+              <input type="number" min={1} max={8760} disabled={!settingsDraft.idle_gpu_reclaim_enabled} value={settingsDraft.idle_gpu_duration_hours} onChange={(e) => setSettingsDraft(s => ({ ...s, idle_gpu_duration_hours: Number(e.target.value) }))} />
+              <span>小时</span>
+            </div>
+          </div>
+          <div className="setting-item setting-item-wide setting-note">
+            GPU 共享时，各容器使用同一张物理卡的统一指标；每个容器仍按其完整 GPU 集合独立判断。
+          </div>
+          {settingsError && <div className="form-error setting-item-wide">{settingsError}</div>}
           <div className="setting-item setting-item-action">
-            <button type="submit" className="btn btn-primary" disabled={settingsSaving}>
+            <button type="submit" className="btn btn-primary" disabled={settingsSaving || !settingsLoaded}>
               {settingsSaving ? "保存中…" : "保存配置"}
             </button>
             <button
               type="button"
               className="btn btn-frosted"
               onClick={() => setSettingsDraft(settings)}
-              disabled={settingsSaving}
+              disabled={settingsSaving || !settingsLoaded}
             >
               重置
             </button>

@@ -487,7 +487,7 @@ def my_containers(user=Depends(get_current_user), db=Depends(get_db)):
 
 @router.delete("/{container_id}")
 def delete_container(container_id: int, user=Depends(get_current_user), db=Depends(get_db)):
-    from app.docker_service import stop_container, remove_container
+    from app.container_lifecycle import remove_container_record
 
     c = db.query(ContainerModel).filter(ContainerModel.id == container_id).first()
     if not c:
@@ -505,17 +505,10 @@ def delete_container(container_id: int, user=Depends(get_current_user), db=Depen
         db.commit()
         return {"message": "已取消待审批申请"}
 
-    if c.container_id:
-        try:
-            stop_container(c.container_id)
-            remove_container(c.container_id)
-        except Exception:
-            pass
+    if c.status == "removed" and not c.container_id:
+        return {"message": "容器已销毁，记录已存档"}
 
-    c.status = "removed"
-    c.stopped_at = datetime.now()
-    c.name = f"{c.name}-del-{int(datetime.now().timestamp())}"
-    c.container_id = None
-
-    db.commit()
+    result = remove_container_record(db, c, "用户主动删除")
+    if not result.success:
+        raise HTTPException(status_code=500, detail=f"容器销毁失败: {result.error or '未知错误'}")
     return {"message": "容器已成功停止并销毁，记录已存档"}

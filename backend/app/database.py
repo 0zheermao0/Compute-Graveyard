@@ -1,7 +1,9 @@
 """数据库模型与初始化"""
+import logging
 from pathlib import Path
 
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, inspect, text
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.orm import sessionmaker, declarative_base
 from sqlalchemy.pool import StaticPool
 
@@ -34,6 +36,7 @@ def init_db():
     _migrate_gpu_ids_nullable()
     _migrate_user_approval()
     _migrate_container_timestamps()
+    _migrate_container_idle_reclaim()
     _migrate_system_settings()
     _migrate_pending_share_json()
 
@@ -93,6 +96,38 @@ def _migrate_container_timestamps():
                 conn.commit()
         except Exception:
             pass
+
+
+def _idle_reclaim_column_types(dialect_name: str) -> dict[str, str]:
+    timestamp_type = "TIMESTAMP" if dialect_name == "postgresql" else "DATETIME"
+    return {
+        "gpu_idle_low_since": timestamp_type,
+        "gpu_idle_last_sample_at": timestamp_type,
+        "removal_reason": "VARCHAR(256)",
+        "removed_at": timestamp_type,
+    }
+
+
+def _is_duplicate_column_error(exc: DBAPIError) -> bool:
+    message = str(getattr(exc, "orig", exc)).lower()
+    return "duplicate column" in message or "already exists" in message
+
+
+def _migrate_container_idle_reclaim(bind=engine):
+    logger = logging.getLogger(__name__)
+    existing = {column["name"] for column in inspect(bind).get_columns("containers")}
+    for column, column_type in _idle_reclaim_column_types(bind.dialect.name).items():
+        if column in existing:
+            continue
+        try:
+            with bind.begin() as conn:
+                conn.execute(text(f"ALTER TABLE containers ADD COLUMN {column} {column_type}"))
+        except DBAPIError as exc:
+            if _is_duplicate_column_error(exc):
+                logger.info("容器表迁移列 %s 已存在", column)
+                continue
+            logger.exception("新增容器表迁移列 %s 失败", column)
+            raise
 
 
 def _migrate_system_settings():

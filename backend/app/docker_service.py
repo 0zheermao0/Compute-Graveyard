@@ -186,13 +186,14 @@ def remove_container(container_id: str) -> bool:
         return False
 
 
-def _parse_mib(s: str) -> int:
+def _parse_mib(s: str) -> Optional[int]:
     """解析 nvidia-smi 的 MiB 数值"""
     s = str(s).replace("MiB", "").replace(" ", "").strip()
     try:
-        return int(float(s))
-    except ValueError:
-        return 0
+        value = int(float(s))
+        return value if value >= 0 else None
+    except (ValueError, TypeError):
+        return None
 
 
 def get_gpu_info() -> List[Dict[str, Any]]:
@@ -224,12 +225,15 @@ def get_gpu_info() -> List[Dict[str, Any]]:
                     util = int(str(parts[5]).replace("%", "").strip()) if len(parts) > 5 else None
                 except (ValueError, TypeError):
                     util = None
+                memory_percent = None
+                if mem_used is not None and mem_total is not None and mem_total > 0:
+                    memory_percent = round(mem_used / mem_total * 100, 1)
                 gpus.append({
                     "index": idx,
                     "name": name,
                     "memory_used_mb": mem_used,
-                    "memory_total_mb": mem_total or 1,
-                    "memory_percent": round(mem_used / (mem_total or 1) * 100, 1),
+                    "memory_total_mb": mem_total,
+                    "memory_percent": memory_percent,
                     "temperature": temp,
                     "utilization": util,
                 })

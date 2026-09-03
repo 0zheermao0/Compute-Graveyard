@@ -37,6 +37,10 @@ class ContainerModel(Base):
     expires_at = Column(DateTime, nullable=False)
     stopped_at = Column(DateTime)  # 停止时间，用于 24h 后清理
     created_at = Column(DateTime, default=datetime.now)
+    gpu_idle_low_since = Column(DateTime, nullable=True)
+    gpu_idle_last_sample_at = Column(DateTime, nullable=True)
+    removal_reason = Column(String(256), nullable=True)
+    removed_at = Column(DateTime, nullable=True)
     # GPU 共用审批：pending_share_json 存 JSON（lease_days、approvers 等），仅在 status=pending_share_approval 时有值
     pending_share_json = Column(Text, nullable=True)
     owner = relationship("UserModel", back_populates="containers")

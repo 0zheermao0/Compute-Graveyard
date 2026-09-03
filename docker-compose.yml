@@ -21,6 +21,10 @@ services:
       - DEFAULT_LEASE_DAYS=3
       - MAX_LEASE_DAYS=7
       - MAX_GPUS_PER_USER=2
+      - IDLE_GPU_RECLAIM_ENABLED=true
+      - IDLE_GPU_UTIL_THRESHOLD_PERCENT=5
+      - IDLE_GPU_MEMORY_THRESHOLD_PERCENT=5
+      - IDLE_GPU_DURATION_HOURS=24
       - TZ=Asia/Shanghai
     restart: unless-stopped
     # 需宿主机已安装 nvidia-container-toolkit，以便容器内执行 nvidia-smi 获取 GPU 信息

@@ -86,10 +86,16 @@ docker compose up --build
 | `SERVICE_PORT_START` / `SERVICE_PORT_END` | Jupyter/TensorBoard/Code Server 映射端口池 | `30000`–`40000` |
 | `DEFAULT_LEASE_DAYS` / `MAX_LEASE_DAYS` | 默认与最大租期（天） | `3` / `7` |
 | `MAX_GPUS_PER_USER` / `MAX_CONTAINERS_PER_USER` | 每用户最大 GPU 数 / 最大同时容器数 | `2` / `4` |
+| `IDLE_GPU_RECLAIM_ENABLED` | GPU 低利用自动回收环境默认开关，后台设置可动态覆盖 | `true` |
+| `IDLE_GPU_UTIL_THRESHOLD_PERCENT` | GPU 整卡利用率环境默认阈值 | `5` |
+| `IDLE_GPU_MEMORY_THRESHOLD_PERCENT` | GPU 整卡显存占用环境默认阈值 | `5` |
+| `IDLE_GPU_DURATION_HOURS` | GPU 连续低利用环境默认时长（小时） | `24` |
 | `DATABASE_URL` | 数据库连接（SQLite 或 PostgreSQL 等） | `sqlite:///./data/lab_gpu.db` |
 | `JWT_SECRET` | JWT 签名密钥 | **务必在生产环境修改** |
 | `PUBLIC_DATASETS` | 可选，公共数据集路径（只读挂载到容器 `/datasets`） | - |
 | `NOTIFY_WEBHOOK` | 可选，钉钉/飞书等 Webhook | - |
+
+管理员可在管理后台动态修改自动回收开关、GPU 利用率阈值、显存占用阈值和连续时长。共享 GPU 使用整张物理卡统一指标，多 GPU 容器仅在全部所选 GPU 都连续低于两个阈值时回收；回收会立即停止并销毁 Docker 容器，但保留宿主机工作区。
 
 Compose 中需把宿主机用户目录挂载进管理服务，例如：
 

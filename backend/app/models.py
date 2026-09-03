@@ -58,9 +58,9 @@ class Token(BaseModel):
 class GPUInfo(BaseModel):
     index: int
     name: str
-    memory_used_mb: int
-    memory_total_mb: int
-    memory_percent: float
+    memory_used_mb: Optional[int] = None
+    memory_total_mb: Optional[int] = None
+    memory_percent: Optional[float] = None
     temperature: Optional[int] = None
     utilization: Optional[int] = None
 
