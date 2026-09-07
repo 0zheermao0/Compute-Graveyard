@@ -32,11 +32,41 @@ interface Container {
   extra_ports?: Record<string, number> | null;
 }
 
+interface QuotaStatus {
+  quota_bytes: number;
+  usage_bytes: number;
+  over_quota: boolean;
+  blocked: boolean;
+  quota_exceeded_since?: string | null;
+  grace_hours: number;
+  grace_deadline?: string | null;
+  scan_complete: boolean;
+  quota_exempt: boolean;
+}
+
+const GIB = 1024 ** 3;
+
+function formatBytes(bytes: number): string {
+  if (bytes >= GIB) return `${(bytes / GIB).toFixed(1)} GiB`;
+  if (bytes >= 1024 ** 2) return `${(bytes / 1024 ** 2).toFixed(1)} MiB`;
+  if (bytes >= 1024) return `${(bytes / 1024).toFixed(1)} KiB`;
+  return `${bytes} B`;
+}
+
+function quotaPercent(quota: QuotaStatus): number {
+  if (!quota.quota_bytes) return 0;
+  return Math.min(100, quota.usage_bytes / quota.quota_bytes * 100);
+}
+
 export default function Workspace() {
   const [currentPath, setCurrentPath] = useState("");
   const [items, setItems] = useState<WorkspaceItem[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
+  const [quota, setQuota] = useState<QuotaStatus | null>(null);
+  const [quotaLoading, setQuotaLoading] = useState(true);
+  const [quotaRefreshing, setQuotaRefreshing] = useState(false);
+  const [quotaError, setQuotaError] = useState("");
   const [editPath, setEditPath] = useState<string | null>(null);
   const [editContent, setEditContent] = useState("");
   const [saving, setSaving] = useState(false);
@@ -62,7 +92,25 @@ export default function Workspace() {
     }
   }, [currentPath]);
 
+  const refreshQuota = useCallback(async (showError = false) => {
+    setQuotaRefreshing(true);
+    setQuotaError("");
+    try {
+      const data = await fetcher<QuotaStatus>("/workspace/usage/refresh", { method: "POST" });
+      setQuota(data);
+    } catch (e) {
+      const message = e instanceof Error ? e.message : "容量统计失败";
+      setQuota(null);
+      setQuotaError(message);
+      if (showError) alert(message);
+    } finally {
+      setQuotaLoading(false);
+      setQuotaRefreshing(false);
+    }
+  }, []);
+
   useEffect(() => { loadList(); }, [loadList]);
+  useEffect(() => { refreshQuota(); }, [refreshQuota]);
 
   const breadcrumbs = currentPath ? ["", ...currentPath.split("/").filter(Boolean)] : [""];
 
@@ -92,7 +140,8 @@ export default function Workspace() {
         body: JSON.stringify({ content: editContent }),
       });
       setEditPath(null);
-      loadList();
+      await loadList();
+      await refreshQuota();
     } catch (e) {
       alert(e instanceof Error ? e.message : "保存失败");
     } finally {
@@ -116,7 +165,8 @@ export default function Workspace() {
           body: JSON.stringify({ content: "" }),
         });
       }
-      loadList();
+      await loadList();
+      await refreshQuota();
     } catch (e) {
       alert(e instanceof Error ? e.message : "创建失败");
     }
@@ -127,10 +177,13 @@ export default function Workspace() {
     try {
       await fetcher(`/workspace?path=${encodeURIComponent(deletePath)}`, { method: "DELETE" });
       setDeletePath(null);
-      if (currentPath === deletePath || (deletePath + "/").startsWith(currentPath + "/") || currentPath.startsWith(deletePath + "/")) {
+      const shouldResetPath = currentPath === deletePath || currentPath.startsWith(deletePath + "/");
+      if (shouldResetPath) {
         setCurrentPath("");
+      } else {
+        await loadList();
       }
-      loadList();
+      await refreshQuota();
     } catch (e) {
       alert(e instanceof Error ? e.message : "删除失败");
     }
@@ -189,6 +242,45 @@ export default function Workspace() {
           <button type="button" className="btn btn-frosted btn-sm" onClick={() => { setCreateType("dir"); setCreateName(""); }}>新建文件夹</button>
         </div>
       </div>
+      <section className={`workspace-quota-card ${quota && (!quota.scan_complete || quota.blocked) ? "is-blocked" : ""}`}>
+        <div className="workspace-quota-header">
+          <div>
+            <span className="workspace-quota-label">个人工作区容量</span>
+            <strong>
+              {quotaLoading && !quota ? "统计中…" : quota ? `${formatBytes(quota.usage_bytes)} / ${formatBytes(quota.quota_bytes)}` : "暂不可用"}
+            </strong>
+          </div>
+          <button type="button" className="btn btn-frosted btn-sm" onClick={() => refreshQuota(true)} disabled={quotaRefreshing}>
+            {quotaRefreshing ? "检测中…" : "重新检测"}
+          </button>
+        </div>
+        {quota && !quota.quota_exempt && (
+          <>
+            <div className="workspace-quota-meter"><span style={{ width: `${quotaPercent(quota)}%` }} /></div>
+            {!quota.scan_complete ? (
+              <div className="workspace-quota-alert">
+                <strong>暂时无法确认工作区容量，已暂停新容器申请</strong>
+                <span>存储路径恢复后会自动重新检测，请稍后重试。</span>
+              </div>
+            ) : quota.over_quota ? (
+              <div className="workspace-quota-alert">
+                <strong>已超过磁盘配额，当前无法申请新容器</strong>
+                <span>请在工作区删除文件；连续超限满 {quota.grace_hours} 小时后，运行中的容器会自动停止。</span>
+                {quota.quota_exceeded_since && (
+                  <span>本次超限开始于 {new Date(quota.quota_exceeded_since).toLocaleString()}。</span>
+                )}
+                {quota.grace_deadline && (
+                  <span>宽限截止时间：{new Date(quota.grace_deadline).toLocaleString()}。</span>
+                )}
+              </div>
+            ) : (
+              <span className="workspace-quota-hint">清理到配额以下后即可正常申请容器。</span>
+            )}
+          </>
+        )}
+        {quota?.quota_exempt && <span className="workspace-quota-hint">管理员账号不受个人磁盘配额限制。</span>}
+        {quotaError && <span className="workspace-quota-error">{quotaError}</span>}
+      </section>
       <div className="workspace-breadcrumb">
         {breadcrumbs.map((part, i) => {
           const path = breadcrumbs.slice(0, i + 1).join("/");

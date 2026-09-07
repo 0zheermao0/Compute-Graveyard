@@ -59,6 +59,85 @@
   gap: 0.5rem;
 }
 
+.workspace-quota-card {
+  position: relative;
+  z-index: 1;
+  margin-bottom: 0.75rem;
+  padding: 0.8rem 1rem;
+  border: 1px solid rgba(52, 211, 153, 0.2);
+  border-radius: var(--radius-md);
+  background: rgba(16, 185, 129, 0.08);
+}
+
+.workspace-quota-card.is-blocked {
+  border-color: rgba(248, 113, 113, 0.4);
+  background: rgba(239, 68, 68, 0.1);
+}
+
+.workspace-quota-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+}
+
+.workspace-quota-header > div {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+}
+
+.workspace-quota-label {
+  color: var(--text-muted);
+  font-size: 0.75rem;
+}
+
+.workspace-quota-header strong {
+  font-family: var(--font-mono);
+  font-size: 0.95rem;
+}
+
+.workspace-quota-meter {
+  height: 7px;
+  margin-top: 0.65rem;
+  overflow: hidden;
+  border-radius: var(--radius-full);
+  background: rgba(0, 0, 0, 0.3);
+}
+
+.workspace-quota-meter > span {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: linear-gradient(90deg, #34d399, #fbbf24);
+  transition: width 0.3s ease;
+}
+
+.workspace-quota-card.is-blocked .workspace-quota-meter > span {
+  background: #f87171;
+}
+
+.workspace-quota-alert,
+.workspace-quota-hint,
+.workspace-quota-error {
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+  margin-top: 0.65rem;
+  color: var(--text-secondary);
+  font-size: 0.8rem;
+  line-height: 1.5;
+}
+
+.workspace-quota-alert strong,
+.workspace-quota-error {
+  color: #f87171;
+}
+
+.workspace-quota-hint {
+  color: #6ee7b7;
+}
+
 .workspace-breadcrumb {
   margin-bottom: 0.5rem;
   font-size: 0.85rem;

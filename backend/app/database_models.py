@@ -1,8 +1,9 @@
 """SQLAlchemy 数据库模型"""
 from datetime import datetime
-from sqlalchemy import Column, Integer, String, DateTime, Boolean, Text, ForeignKey, JSON
-from sqlalchemy.orm import relationship
+from sqlalchemy import BigInteger, Column, Integer, String, DateTime, Boolean, Text, ForeignKey, JSON, text
+from sqlalchemy.orm import relationship, synonym
 
+from app.config import DEFAULT_DISK_QUOTA_BYTES
 from app.database import Base  # noqa: F401
 
 
@@ -19,6 +20,18 @@ class UserModel(Base):
     approved = Column(Integer, default=0)  # 0 待审批 1 已通过，admin 默认 1
     role = Column(String(16), default="user")  # user | admin
     created_at = Column(DateTime, default=datetime.now)
+    disk_quota_bytes = Column(BigInteger, nullable=False, default=DEFAULT_DISK_QUOTA_BYTES, server_default=text(str(DEFAULT_DISK_QUOTA_BYTES)))
+    disk_usage_bytes = Column(BigInteger, nullable=False, default=0, server_default=text("0"))
+    disk_usage_checked_at = Column(DateTime, nullable=True)
+    disk_usage_scan_complete = Column(Boolean, nullable=False, default=False, server_default=text("false"))
+    disk_quota_exceeded_since = Column(DateTime, nullable=True)
+    disk_quota_blocked = Column(Boolean, nullable=False, default=False, server_default=text("false"))
+    quota_bytes = synonym("disk_quota_bytes")
+    usage_bytes = synonym("disk_usage_bytes")
+    quota_exceeded_since = synonym("disk_quota_exceeded_since")
+    disk_quota_over_since = synonym("disk_quota_exceeded_since")
+    over_quota_since = synonym("disk_quota_exceeded_since")
+    quota_blocked = synonym("disk_quota_blocked")
     containers = relationship("ContainerModel", back_populates="owner")
 
 
@@ -34,6 +47,7 @@ class ContainerModel(Base):
     extra_ports = Column(String(256), nullable=True)  # JSON: {"8888":30123,"6006":30124,"8080":30125}
     ssh_password = Column(String(64), nullable=True)  # 随机生成，仅容器拥有者可见
     status = Column(String(16), default="running")  # running | stopped | removed | pending_share_approval | share_rejected
+    stop_reason = Column(String(64), nullable=True)
     expires_at = Column(DateTime, nullable=False)
     stopped_at = Column(DateTime)  # 停止时间，用于 24h 后清理
     created_at = Column(DateTime, default=datetime.now)

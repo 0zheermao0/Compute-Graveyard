@@ -57,3 +57,9 @@ async def startup():
     create_default_admin()
     from app.scheduler import start_scheduler
     start_scheduler()
+
+
+@app.on_event("shutdown")
+async def shutdown():
+    from app.scheduler import stop_scheduler
+    stop_scheduler()

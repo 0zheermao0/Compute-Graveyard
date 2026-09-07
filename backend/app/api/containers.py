@@ -2,6 +2,8 @@
 import json
 import uuid
 from datetime import datetime, timedelta
+from functools import wraps
+from threading import RLock
 
 from fastapi import APIRouter, Depends, HTTPException
 
@@ -30,8 +32,18 @@ from app.config import (
     DEFAULT_MAX_GPU_SHARING_USERS,
 )
 from app.database import get_setting
+from app.quota_service import check_user_can_provision
 
 router = APIRouter()
+_share_action_lock = RLock()
+
+
+def _synchronized_share_action(func):
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        with _share_action_lock:
+            return func(*args, **kwargs)
+    return wrapper
 
 
 def _max_gpu_sharing(db) -> int:
@@ -122,6 +134,7 @@ def _response_from_container(db, c: ContainerModel, owner_username: str | None =
         ssh_password=c.ssh_password,
         extra_ports=ep_int,
         status=c.status,
+        stop_reason=getattr(c, "stop_reason", None),
         expires_at=c.expires_at,
         owner_username=uname or "",
         created_at=c.created_at,
@@ -136,7 +149,20 @@ def _provision_running_container(db, c: ContainerModel, lease_days: int) -> None
     if not user:
         raise HTTPException(status_code=500, detail="用户不存在")
 
+    quota = check_user_can_provision(db, user, commit=False)
+    if not quota.allowed:
+        detail = "暂时无法确认工作区容量，请稍后重试" if not quota.scan_complete else "工作区已超过磁盘配额，请清理文件后再申请容器"
+        raise HTTPException(status_code=400, detail=detail)
+
     gpu_ids = [int(x) for x in c.gpu_ids.split(",")] if c.gpu_ids else []
+
+    my_running = db.query(ContainerModel).filter(
+        ContainerModel.user_id == c.user_id,
+        ContainerModel.status == "running",
+    ).all()
+    total_gpus = sum(len(item.gpu_ids.split(",")) for item in my_running if item.gpu_ids)
+    if total_gpus + len(gpu_ids) > MAX_GPUS_PER_USER:
+        raise HTTPException(status_code=400, detail=f"每人最多使用 {MAX_GPUS_PER_USER} 块 GPU")
 
     users_per_gpu = _distinct_users_per_gpu_map(db)
     mx = _max_gpu_sharing(db)
@@ -185,6 +211,11 @@ def _provision_running_container(db, c: ContainerModel, lease_days: int) -> None
 def apply_container(req: ContainerApplyRequest, user=Depends(get_current_user), db=Depends(get_db)):
     if user.role not in ("user", "admin"):
         raise HTTPException(status_code=403, detail="无权限申请")
+
+    quota = check_user_can_provision(db, user)
+    if not quota.allowed:
+        detail = "暂时无法确认工作区容量，请稍后重试" if not quota.scan_complete else "工作区已超过磁盘配额，请清理文件后再申请容器"
+        raise HTTPException(status_code=400, detail=detail)
 
     if req.lease_days < 1 or req.lease_days > MAX_LEASE_DAYS:
         raise HTTPException(status_code=400, detail=f"租期须在 1~{MAX_LEASE_DAYS} 天之间")
@@ -416,6 +447,7 @@ def list_notifications(user=Depends(get_current_user), db=Depends(get_db)):
 
 
 @router.post("/{container_id}/approve-share")
+@_synchronized_share_action
 def approve_share(container_id: int, user=Depends(get_current_user), db=Depends(get_db)):
     c = db.query(ContainerModel).filter(ContainerModel.id == container_id).first()
     if not c or c.status != "pending_share_approval":
@@ -431,6 +463,16 @@ def approve_share(container_id: int, user=Depends(get_current_user), db=Depends(
 
     if me.get("approved"):
         return {"message": "您已同意过"}
+
+    will_complete = all(bool(a.get("approved")) or a is me for a in approvers)
+    if will_complete:
+        applicant = db.query(UserModel).filter(UserModel.id == c.user_id).first()
+        if not applicant:
+            raise HTTPException(status_code=500, detail="用户不存在")
+        quota = check_user_can_provision(db, applicant)
+        if not quota.allowed:
+            detail = "暂时无法确认申请人的工作区容量，请稍后重试" if not quota.scan_complete else "申请人的工作区已超过磁盘配额，清理文件后才能创建容器"
+            raise HTTPException(status_code=400, detail=detail)
 
     me["approved"] = True
     me["approved_at"] = datetime.now().isoformat()
@@ -451,6 +493,7 @@ def approve_share(container_id: int, user=Depends(get_current_user), db=Depends(
 
 
 @router.post("/{container_id}/reject-share")
+@_synchronized_share_action
 def reject_share(container_id: int, user=Depends(get_current_user), db=Depends(get_db)):
     c = db.query(ContainerModel).filter(ContainerModel.id == container_id).first()
     if not c or c.status != "pending_share_approval":

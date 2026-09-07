@@ -7,7 +7,7 @@ from sqlalchemy.exc import DBAPIError
 from sqlalchemy.orm import sessionmaker, declarative_base
 from sqlalchemy.pool import StaticPool
 
-from app.config import DATABASE_URL, DATA_DIR
+from app.config import DATABASE_URL, DATA_DIR, DEFAULT_DISK_QUOTA_BYTES
 
 # 解析 sqlite 路径，确保使用绝对路径且目录存在
 _db_url = DATABASE_URL
@@ -39,6 +39,8 @@ def init_db():
     _migrate_container_idle_reclaim()
     _migrate_system_settings()
     _migrate_pending_share_json()
+    _migrate_disk_quota()
+    _migrate_container_stop_reason()
 
 
 def _migrate_pending_share_json():
@@ -49,6 +51,69 @@ def _migrate_pending_share_json():
             conn.commit()
     except Exception:
         pass
+
+
+def _disk_quota_column_types(dialect_name: str) -> dict[str, str]:
+    timestamp_type = "TIMESTAMP" if dialect_name == "postgresql" else "DATETIME"
+    boolean_type = "BOOLEAN" if dialect_name == "postgresql" else "INTEGER"
+    return {
+        "disk_quota_bytes": "BIGINT",
+        "disk_usage_bytes": "BIGINT",
+        "disk_usage_checked_at": timestamp_type,
+        "disk_usage_scan_complete": boolean_type,
+        "disk_quota_exceeded_since": timestamp_type,
+        "disk_quota_blocked": boolean_type,
+    }
+
+
+def _add_missing_columns(bind, table_name: str, columns: dict[str, str]) -> None:
+    if not inspect(bind).has_table(table_name):
+        return
+    existing = {column["name"] for column in inspect(bind).get_columns(table_name)}
+    logger = logging.getLogger(__name__)
+    for column, column_definition in columns.items():
+        if column in existing:
+            continue
+        try:
+            with bind.begin() as conn:
+                conn.execute(text(f"ALTER TABLE {table_name} ADD COLUMN {column} {column_definition}"))
+            existing.add(column)
+        except DBAPIError as exc:
+            if _is_duplicate_column_error(exc):
+                logger.info("迁移列 %s 已存在", column)
+                existing.add(column)
+                continue
+            logger.exception("新增表 %s 迁移列 %s 失败", table_name, column)
+            raise
+
+
+def _migrate_disk_quota(bind=None):
+    if bind is None:
+        bind = engine
+    dialect_name = bind.dialect.name
+    types = _disk_quota_column_types(dialect_name)
+    defaults = {
+        "disk_quota_bytes": f"{types['disk_quota_bytes']} NOT NULL DEFAULT {DEFAULT_DISK_QUOTA_BYTES}",
+        "disk_usage_bytes": f"{types['disk_usage_bytes']} NOT NULL DEFAULT 0",
+        "disk_usage_checked_at": types["disk_usage_checked_at"],
+        "disk_usage_scan_complete": f"{types['disk_usage_scan_complete']} NOT NULL DEFAULT {'FALSE' if dialect_name == 'postgresql' else '0'}",
+        "disk_quota_exceeded_since": types["disk_quota_exceeded_since"],
+        "disk_quota_blocked": f"{types['disk_quota_blocked']} NOT NULL DEFAULT {'FALSE' if dialect_name == 'postgresql' else '0'}",
+    }
+    _add_missing_columns(bind, "users", defaults)
+    if not inspect(bind).has_table("users"):
+        return
+    with bind.begin() as conn:
+        conn.execute(text("UPDATE users SET disk_quota_bytes = :quota WHERE disk_quota_bytes IS NULL"), {"quota": DEFAULT_DISK_QUOTA_BYTES})
+        conn.execute(text("UPDATE users SET disk_usage_bytes = 0 WHERE disk_usage_bytes IS NULL"))
+        conn.execute(text("UPDATE users SET disk_usage_scan_complete = :complete WHERE disk_usage_scan_complete IS NULL"), {"complete": False})
+        conn.execute(text("UPDATE users SET disk_quota_blocked = :blocked WHERE disk_quota_blocked IS NULL"), {"blocked": False})
+
+
+def _migrate_container_stop_reason(bind=None):
+    if bind is None:
+        bind = engine
+    _add_missing_columns(bind, "containers", {"stop_reason": "VARCHAR(64)"})
 
 
 def _migrate_add_ssh_password():
@@ -183,6 +248,7 @@ def create_default_admin():
                 role="admin",
                 display_name="管理员",
                 approved=1,
+                disk_quota_bytes=DEFAULT_DISK_QUOTA_BYTES,
             )
             db.add(admin)
             db.commit()

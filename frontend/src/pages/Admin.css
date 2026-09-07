@@ -127,6 +127,80 @@
   background: rgba(51, 154, 240, 0.2);
 }
 
+.quota-usage-cell {
+  min-width: 150px;
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+  font-family: var(--font-mono);
+  font-size: 0.8rem;
+}
+
+.quota-meter {
+  display: block;
+  height: 5px;
+  overflow: hidden;
+  border-radius: var(--radius-full);
+  background: rgba(255, 255, 255, 0.1);
+}
+
+.quota-meter > span {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: var(--mint);
+  transition: width 0.25s ease;
+}
+
+.quota-editor {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+  min-width: 230px;
+}
+
+.quota-editor input {
+  width: 5.5rem;
+  padding: 0.35rem 0.45rem;
+  border: 1px solid var(--glass-border-light);
+  border-radius: var(--radius-sm);
+  background: rgba(255, 255, 255, 0.05);
+  color: var(--text);
+  font-family: var(--font-mono);
+}
+
+.quota-editor input:focus {
+  outline: none;
+  border-color: var(--sky-soft);
+}
+
+.quota-editor > span {
+  color: var(--text-muted);
+  font-size: 0.75rem;
+}
+
+.quota-status {
+  display: inline-block;
+  white-space: nowrap;
+  font-size: 0.78rem;
+}
+
+.quota-status.normal {
+  color: var(--mint);
+}
+
+.quota-status.blocked {
+  color: var(--danger);
+  font-weight: 700;
+}
+
+.quota-since {
+  display: block;
+  margin-top: 0.3rem;
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+
 .btn-small {
   padding: 0.35rem 0.75rem;
   font-size: 0.85rem;

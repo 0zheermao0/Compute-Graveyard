@@ -6,10 +6,11 @@ import os
 import secrets
 import subprocess
 import json
+from pathlib import Path
 from typing import List, Optional, Dict, Any
 
 import docker
-from docker.errors import DockerException
+from docker.errors import DockerException, NotFound
 
 from app.config import (
     USER_DATA_BASE,
@@ -88,9 +89,16 @@ def allocate_service_ports() -> Optional[Dict[int, int]]:
 
 def ensure_user_dir(username: str) -> str:
     """确保用户目录存在"""
-    path = os.path.join(USER_DATA_BASE, username)
-    os.makedirs(path, exist_ok=True)
-    return path
+    if not username or "/" in username or "\\" in username or username in {".", ".."}:
+        raise ValueError("用户名包含非法路径字符")
+    base = Path(USER_DATA_BASE)
+    if not base.exists() or not base.is_dir():
+        raise RuntimeError("用户工作区存储路径不可用")
+    path = base / username
+    if path.is_symlink():
+        raise RuntimeError("用户工作区路径非法")
+    path.mkdir(exist_ok=True)
+    return str(path)
 
 
 def create_container(
@@ -170,6 +178,8 @@ def stop_container(container_id: str) -> bool:
         client = get_docker_client()
         c = client.containers.get(container_id)
         c.stop()
+        return True
+    except NotFound:
         return True
     except DockerException:
         return False

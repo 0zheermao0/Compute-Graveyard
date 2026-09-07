@@ -165,6 +165,18 @@
   color: #fbbf24;
 }
 
+.status-badge.quota-stopped {
+  background: rgba(239, 68, 68, 0.2);
+  color: #f87171;
+}
+
+.quota-stop-hint {
+  display: block;
+  margin-top: 0.35rem;
+  color: #fca5a5;
+  white-space: nowrap;
+}
+
 .status-badge.removed {
   background: rgba(82, 82, 91, 0.3);
   color: #a1a1aa;

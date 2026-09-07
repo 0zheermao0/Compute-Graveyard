@@ -66,6 +66,48 @@
   font-weight: 700;
 }
 
+.dashboard-header .btn-primary:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+.dashboard-quota-alert {
+  position: relative;
+  z-index: 10;
+  margin: -0.25rem 0 1rem;
+  padding: 0.7rem 1rem;
+  border: 1px solid rgba(248, 113, 113, 0.4);
+  border-radius: var(--radius-md);
+  background: rgba(239, 68, 68, 0.12);
+  color: #f87171;
+  font-size: 0.85rem;
+}
+
+.dashboard-quota-meter {
+  display: block;
+  height: 5px;
+  margin-top: 0.45rem;
+  overflow: hidden;
+  border-radius: var(--radius-full);
+  background: rgba(0, 0, 0, 0.3);
+}
+
+.dashboard-quota-meter > span {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: #34d399;
+  transition: width 0.3s ease;
+}
+
+.disk-quota-card.over {
+  border-color: rgba(248, 113, 113, 0.4);
+}
+
+.disk-quota-card.over .dashboard-quota-meter > span {
+  background: #f87171;
+}
+
 /* ========== 主布局：左侧内容 + 右侧排行 ========== */
 .dashboard-twin .dashboard-body {
   position: relative;

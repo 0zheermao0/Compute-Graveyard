@@ -154,6 +154,7 @@ class ContainerResponse(BaseModel):
     expires_at: datetime
     owner_username: str
     created_at: datetime
+    stop_reason: Optional[str] = None
     # 以下为 GPU 共用审批（仅 pending_share_approval 时有意义）
     share_approvers: Optional[List[ShareApproverInfo]] = None
     pending_lease_days: Optional[int] = None

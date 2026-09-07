@@ -1,5 +1,4 @@
 """用户工作区文件 API：列出、读取、编辑、删除、创建（仅限当前用户目录）"""
-import os
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -7,8 +6,10 @@ from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel
 
 from app.auth import get_current_user
+from app.database import get_db
 from app.config import USER_DATA_BASE
 from app.docker_service import ensure_user_dir
+from app.quota_service import quota_status, quota_status_payload, refresh_user_quota
 
 router = APIRouter()
 
@@ -19,17 +20,34 @@ DEFAULT_AS_TEXT = True
 
 
 def _user_root(user) -> Path:
-    return Path(USER_DATA_BASE) / user.username
+    username = str(user.username or "")
+    if not username or "/" in username or "\\" in username or username in {".", ".."}:
+        raise HTTPException(status_code=400, detail="用户工作区路径非法")
+    return Path(USER_DATA_BASE) / username
 
 
 def _resolve_path(user, subpath: str) -> Path:
     """解析子路径，确保在用户目录内，禁止 .."""
     root = _user_root(user)
-    subpath = (subpath or "").strip().lstrip("/")
-    if ".." in subpath or subpath.startswith(".."):
+    subpath = (subpath or "").strip()
+    relative = Path(subpath)
+    if relative.is_absolute() or ".." in relative.parts:
         raise HTTPException(status_code=400, detail="路径非法")
-    full = (root / subpath).resolve()
-    if not str(full).startswith(str(root.resolve())):
+    try:
+        if root.is_symlink():
+            raise HTTPException(status_code=400, detail="工作区路径非法")
+        candidate = root.joinpath(relative)
+        current = root
+        for part in relative.parts:
+            current = current / part
+            if current.is_symlink():
+                raise HTTPException(status_code=400, detail="路径包含非法符号链接")
+        root_resolved = root.resolve()
+        full = candidate.resolve()
+        full.relative_to(root_resolved)
+    except HTTPException:
+        raise
+    except (OSError, ValueError):
         raise HTTPException(status_code=400, detail="路径超出工作区")
     return full
 
@@ -45,6 +63,26 @@ def _is_text_path(path: Path) -> bool:
     return False
 
 
+def _usage_response(user, db, refresh: bool = False):
+    status = refresh_user_quota(db, user) if refresh else quota_status(user)
+    return quota_status_payload(user, status)
+
+
+@router.get("/usage")
+def workspace_usage(user=Depends(get_current_user), db=Depends(get_db)):
+    return _usage_response(user, db)
+
+
+@router.post("/usage/refresh")
+def refresh_workspace_usage(user=Depends(get_current_user), db=Depends(get_db)):
+    return _usage_response(user, db, refresh=True)
+
+
+@router.get("/quota")
+def workspace_quota(user=Depends(get_current_user), db=Depends(get_db)):
+    return _usage_response(user, db)
+
+
 @router.get("/list")
 def list_dir(
     path: str = Query("", description="相对路径，空为根目录"),
@@ -52,7 +90,7 @@ def list_dir(
 ):
     """列出工作区目录内容"""
     ensure_user_dir(user.username)
-    root = _user_root(user)
+    root = _resolve_path(user, "")
     target = _resolve_path(user, path)
     if not target.exists():
         raise HTTPException(status_code=404, detail="路径不存在")
@@ -60,6 +98,8 @@ def list_dir(
         raise HTTPException(status_code=400, detail="不是目录")
     items = []
     for p in sorted(target.iterdir(), key=lambda x: (not x.is_dir(), x.name.lower())):
+        if p.is_symlink():
+            continue
         rel = p.relative_to(root)
         items.append({
             "name": p.name,
@@ -124,8 +164,8 @@ def create_dir(
     user=Depends(get_current_user),
 ):
     """创建目录"""
+    ensure_user_dir(user.username)
     target = _resolve_path(user, body.path.strip())
-    root = _user_root(user)
     if target.exists():
         raise HTTPException(status_code=400, detail="已存在")
     target.mkdir(parents=True, exist_ok=True)
@@ -141,7 +181,7 @@ def delete_path(
     target = _resolve_path(user, path)
     if not target.exists():
         raise HTTPException(status_code=404, detail="不存在")
-    if target == _user_root(user):
+    if target == _resolve_path(user, ""):
         raise HTTPException(status_code=400, detail="不能删除根目录")
     if target.is_dir():
         if any(target.iterdir()):

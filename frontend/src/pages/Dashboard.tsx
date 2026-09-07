@@ -56,6 +56,26 @@ interface GpuSharingStatus {
   selectable: boolean;
 }
 
+interface QuotaStatus {
+  quota_bytes: number;
+  usage_bytes: number;
+  over_quota: boolean;
+  blocked: boolean;
+  scan_complete: boolean;
+  quota_exempt: boolean;
+}
+
+const GIB = 1024 ** 3;
+
+function formatGiB(bytes: number): string {
+  return `${(bytes / GIB).toFixed(1)} GiB`;
+}
+
+function quotaPercent(quota: QuotaStatus): number {
+  if (!quota.quota_bytes) return 0;
+  return Math.min(100, quota.usage_bytes / quota.quota_bytes * 100);
+}
+
 interface DashboardData {
   gpus: GPUInfo[];
   system_load: {
@@ -79,6 +99,9 @@ export default function Dashboard() {
   const [error, setError] = useState("");
   const [showApply, setShowApply] = useState(false);
   const [rankMode, setRankMode] = useState<"weekly" | "monthly">("weekly");
+  const [quota, setQuota] = useState<QuotaStatus | null>(null);
+  const [quotaLoading, setQuotaLoading] = useState(true);
+  const [quotaError, setQuotaError] = useState(false);
 
   const load = async () => {
     try {
@@ -95,13 +118,35 @@ export default function Dashboard() {
     }
   };
 
+  const loadQuota = async (refresh = false) => {
+    try {
+      const value = await fetcher<QuotaStatus>(
+        refresh ? "/workspace/usage/refresh" : "/workspace/usage",
+        refresh ? { method: "POST" } : undefined,
+      );
+      setQuota(value);
+      setQuotaError(false);
+    } catch {
+      setQuota(null);
+      setQuotaError(true);
+    } finally {
+      setQuotaLoading(false);
+    }
+  };
+
   useEffect(() => {
     load();
-    const id = setInterval(load, 10000);
+    loadQuota(true);
+    const id = setInterval(() => {
+      load();
+      loadQuota();
+    }, 10000);
     return () => clearInterval(id);
   }, []);
 
   const ranking = rankMode === "weekly" ? (data?.weekly_ranking ?? []) : (data?.monthly_ranking ?? []);
+  const quotaBlocked = Boolean(quota && !quota.quota_exempt && (!quota.scan_complete || quota.blocked));
+  const applyDisabled = quotaLoading || quotaError || quotaBlocked;
 
   if (error && !data) {
     return <div className="dashboard-error">加载看板失败: {error}</div>;
@@ -113,10 +158,22 @@ export default function Dashboard() {
       <div className="dashboard-twin-glow" aria-hidden />
       <div className="dashboard-header">
         <h1>资源看板</h1>
-        <button className="btn btn-primary" onClick={() => setShowApply(true)}>
-          申请 GPU 容器
+        <button
+          className="btn btn-primary"
+          onClick={() => setShowApply(true)}
+          disabled={applyDisabled}
+          title={quotaError ? "暂时无法确认工作区容量" : quotaBlocked ? "工作区超过磁盘配额，请先清理文件" : undefined}
+        >
+          {quotaError ? "容量不可用，无法申请" : quotaBlocked ? "空间超限，无法申请" : "申请 GPU 容器"}
         </button>
       </div>
+      {(quotaError || quotaBlocked) && (
+        <div className="dashboard-quota-alert">
+          {quotaError || (quota && !quota.scan_complete)
+            ? "暂时无法确认工作区容量，为安全起见已暂停新容器申请，请稍后重试。"
+            : `工作区已使用 ${formatGiB(quota!.usage_bytes)} / ${formatGiB(quota!.quota_bytes)}，请前往工作区清理文件后再申请。`}
+        </div>
+      )}
 
       <div className="dashboard-body">
         <div className="dashboard-main">
@@ -139,6 +196,13 @@ export default function Dashboard() {
                   <span className="load-label">工作区可用</span>
                   <span className="load-value">{data.system_load.disk_free_gb} GB</span>
                 </div>
+                {quota && !quota.quota_exempt && (
+                  <div className={`load-card disk-quota-card ${quotaBlocked ? "over" : ""}`}>
+                    <span className="load-label">个人空间</span>
+                    <span className="load-value">{formatGiB(quota.usage_bytes)} / {formatGiB(quota.quota_bytes)}</span>
+                    <span className="dashboard-quota-meter"><span style={{ width: `${quotaPercent(quota)}%` }} /></span>
+                  </div>
+                )}
               </div>
             </section>
           )}

@@ -1,5 +1,9 @@
 """管理员 API"""
 import json
+import re
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+from typing import Optional
+
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
@@ -11,20 +15,26 @@ from app.models import UserCreate, UserResponse
 from app.auth import get_password_hash
 from app.container_lifecycle import remove_container_record
 from app.settings_service import SettingsValues, load_settings, save_settings
+from app.config import DEFAULT_DISK_QUOTA_BYTES
+from app.quota_service import quota_status, quota_status_payload, refresh_user_quota
 
 router = APIRouter()
 
 
 @router.post("/users", response_model=dict)
 def create_user(req: UserCreate, admin=Depends(get_current_admin), db=Depends(get_db)):
-    if db.query(UserModel).filter(UserModel.username == req.username).first():
+    username = req.username.strip().lower()
+    if not re.fullmatch(r"[a-z][a-z0-9-]{1,29}", username):
+        raise HTTPException(status_code=400, detail="用户名请使用小写字母、数字或连字符，长度为 2~30 位")
+    if db.query(UserModel).filter(UserModel.username == username).first():
         raise HTTPException(status_code=400, detail="用户名已存在")
     user = UserModel(
-        username=req.username,
+        username=username,
         hashed_password=get_password_hash(req.password),
         display_name=req.display_name or req.username,
         role="user",
         approved=1,  # 管理员直接创建的用户默认通过
+        disk_quota_bytes=DEFAULT_DISK_QUOTA_BYTES,
     )
     db.add(user)
     db.commit()
@@ -35,8 +45,10 @@ def create_user(req: UserCreate, admin=Depends(get_current_admin), db=Depends(ge
 @router.get("/users", response_model=list)
 def list_users(admin=Depends(get_current_admin), db=Depends(get_db)):
     users = db.query(UserModel).all()
-    return [
-        {
+    result = []
+    for u in users:
+        quota = quota_status(u)
+        result.append({
             "id": u.id,
             "username": u.username,
             "display_name": u.display_name or "",
@@ -46,9 +58,102 @@ def list_users(admin=Depends(get_current_admin), db=Depends(get_db)):
             "approved": bool(getattr(u, "approved", 1)),
             "role": u.role,
             "created_at": u.created_at,
-        }
-        for u in users
-    ]
+            "disk_quota_bytes": quota.quota_bytes,
+            "disk_usage_bytes": quota.usage_bytes,
+            "disk_quota_blocked": quota.blocked,
+            "disk_quota_exceeded_since": quota.exceeded_since,
+            "scan_complete": quota.scan_complete,
+            "usage_checked_at": getattr(u, "disk_usage_checked_at", None),
+            "quota_bytes": quota.quota_bytes,
+            "usage_bytes": quota.usage_bytes,
+            "blocked": quota.blocked,
+            "quota_blocked": quota.blocked,
+            "over_quota_since": quota.exceeded_since,
+            "disk_quota_over_since": quota.exceeded_since,
+            "over_quota": quota.over_quota,
+            "quota_exempt": quota.exempt,
+        })
+    return result
+
+
+class DiskQuotaUpdate(BaseModel):
+    quota_bytes: Optional[int] = None
+    disk_quota_bytes: Optional[int] = None
+    quota_gb: Optional[float] = None
+    disk_quota_gb: Optional[float] = None
+    quota_gib: Optional[float] = None
+    disk_quota_gib: Optional[float] = None
+    limit_bytes: Optional[int] = None
+    limit_gb: Optional[float] = None
+    limit_gib: Optional[float] = None
+
+
+def _requested_quota_bytes(req: DiskQuotaUpdate) -> int:
+    values = req.model_dump() if hasattr(req, "model_dump") else req.dict()
+    byte_values = [values[key] for key in ("quota_bytes", "disk_quota_bytes", "limit_bytes") if values.get(key) is not None]
+    gib_values = [values[key] for key in ("quota_gb", "disk_quota_gb", "quota_gib", "disk_quota_gib", "limit_gb", "limit_gib") if values.get(key) is not None]
+    if byte_values and gib_values:
+        raise HTTPException(status_code=400, detail="只能指定一种配额单位")
+    if len({int(value) for value in byte_values}) > 1:
+        raise HTTPException(status_code=400, detail="配额参数不一致")
+    if len({str(value) for value in gib_values}) > 1:
+        raise HTTPException(status_code=400, detail="配额参数不一致")
+    if byte_values:
+        quota_bytes = int(byte_values[0])
+    elif gib_values:
+        try:
+            quota_bytes_decimal = Decimal(str(gib_values[0])) * Decimal(1024**3)
+        except (InvalidOperation, ValueError):
+            raise HTTPException(status_code=400, detail="配额必须是有效数字")
+        if not quota_bytes_decimal.is_finite():
+            raise HTTPException(status_code=400, detail="配额必须是有效数字")
+        quota_bytes = int(quota_bytes_decimal.to_integral_value(rounding=ROUND_HALF_UP))
+    else:
+        raise HTTPException(status_code=400, detail="缺少配额值")
+    if quota_bytes <= 0 or quota_bytes > 2**63 - 1:
+        raise HTTPException(status_code=400, detail="配额必须是正整数且不能超过数据库支持范围")
+    return quota_bytes
+
+
+def _find_quota_user(user_id: int, db):
+    user = db.query(UserModel).filter(UserModel.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="用户不存在")
+    return user
+
+
+def _quota_response(user, db, refresh: bool = False):
+    status = refresh_user_quota(db, user) if refresh else quota_status(user)
+    return quota_status_payload(user, status)
+
+
+@router.get("/quota", response_model=list)
+@router.get("/quota/users", response_model=list)
+def list_quotas(admin=Depends(get_current_admin), db=Depends(get_db)):
+    return [_quota_response(user, db) for user in db.query(UserModel).all()]
+
+
+@router.get("/users/{user_id}/quota")
+@router.get("/quota/users/{user_id}")
+def get_user_quota(user_id: int, admin=Depends(get_current_admin), db=Depends(get_db)):
+    return _quota_response(_find_quota_user(user_id, db), db)
+
+
+@router.put("/users/{user_id}/quota")
+@router.put("/quota/users/{user_id}")
+def update_user_quota(user_id: int, req: DiskQuotaUpdate, admin=Depends(get_current_admin), db=Depends(get_db)):
+    user = _find_quota_user(user_id, db)
+    new_quota_bytes = _requested_quota_bytes(req)
+    if int(user.disk_quota_bytes or 0) != new_quota_bytes:
+        user.disk_quota_exceeded_since = None
+        user.disk_quota_blocked = False
+    user.disk_quota_bytes = new_quota_bytes
+    return _quota_response(user, db, refresh=True)
+
+
+@router.post("/users/{user_id}/quota/refresh")
+def refresh_user_quota_for_admin(user_id: int, admin=Depends(get_current_admin), db=Depends(get_db)):
+    return _quota_response(_find_quota_user(user_id, db), db, refresh=True)
 
 
 @router.get("/users/pending", response_model=list)
@@ -120,6 +225,7 @@ def force_stop(container_id: int, admin=Depends(get_current_admin), db=Depends(g
         raise HTTPException(status_code=404, detail="容器不存在")
     if c.container_id and stop_container(c.container_id):
         c.status = "stopped"
+        c.stop_reason = "admin"
         from datetime import datetime
         c.stopped_at = datetime.now()
         db.commit()
@@ -156,6 +262,7 @@ def list_all_containers(admin=Depends(get_current_admin), db=Depends(get_db)):
             "extra_ports": ep,
             "ssh_password": r.ssh_password,
             "status": r.status,
+            "stop_reason": getattr(r, "stop_reason", None),
             "expires_at": r.expires_at,
             "owner_username": owner.username if owner else "",
             "created_at": r.created_at,

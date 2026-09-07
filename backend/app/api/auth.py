@@ -7,6 +7,7 @@ from app.database import get_db
 from app.database_models import UserModel
 from app.models import UserResponse, Token, UserRegister, UserProfileUpdate, UserPasswordChange
 from app.auth import verify_password, create_access_token, get_current_user, get_password_hash
+from app.config import DEFAULT_DISK_QUOTA_BYTES
 
 router = APIRouter()
 
@@ -63,7 +64,14 @@ def init_admin(db=Depends(get_db)):
     admin = db.query(UserModel).filter(UserModel.username == "admin").first()
     correct_hash = get_password_hash("admin123")
     if not admin:
-        admin = UserModel(username="admin", hashed_password=correct_hash, role="admin", display_name="管理员", approved=1)
+        admin = UserModel(
+            username="admin",
+            hashed_password=correct_hash,
+            role="admin",
+            display_name="管理员",
+            approved=1,
+            disk_quota_bytes=DEFAULT_DISK_QUOTA_BYTES,
+        )
         db.add(admin)
         db.commit()
         return {"message": "已创建 admin 账号"}
@@ -99,6 +107,7 @@ def register(req: UserRegister, db=Depends(get_db)):
         contact_value=req.contact_value.strip(),
         approved=0,
         role="user",
+        disk_quota_bytes=DEFAULT_DISK_QUOTA_BYTES,
     )
     db.add(user)
     db.commit()

@@ -6,11 +6,12 @@ from typing import Iterable, Mapping, Optional
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 
-from app.config import NOTIFY_WEBHOOK
+from app.config import DISK_QUOTA_GRACE_HOURS, DISK_QUOTA_SCAN_INTERVAL_MINUTES, NOTIFY_WEBHOOK
 from app.container_lifecycle import remove_container_record
 from app.database import SessionLocal
-from app.database_models import ContainerModel, SystemSettings
+from app.database_models import ContainerModel, SystemSettings, UserModel
 from app.docker_service import get_gpu_info, stop_container
+from app.quota_service import refresh_user_quota
 from app.settings_service import idle_policy_signature, load_settings
 
 logger = logging.getLogger(__name__)
@@ -130,6 +131,73 @@ def _candidate_still_reclaimable(db, container_id: int, snapshot: dict, signatur
     return container, current_settings
 
 
+def _mark_stopped_if_running(db, container_id: int, reason: str, now: datetime) -> Optional[ContainerModel]:
+    container = db.query(ContainerModel).filter(
+        ContainerModel.id == container_id,
+        ContainerModel.status == "running",
+    ).first()
+    if not container:
+        return None
+    container.status = "stopped"
+    container.stop_reason = reason
+    container.stopped_at = now
+    container.gpu_idle_low_since = None
+    container.gpu_idle_last_sample_at = None
+    db.commit()
+    return container
+
+
+def _stop_disk_quota_containers(db, user: UserModel, now: datetime) -> None:
+    containers = db.query(ContainerModel).filter(
+        ContainerModel.user_id == user.id,
+        ContainerModel.status == "running",
+    ).all()
+    for container in containers:
+        if not container.container_id:
+            logger.error("磁盘配额容器 %s 缺少 Docker ID，无法停止", container.name)
+            continue
+        try:
+            stopped = stop_container(container.container_id)
+            if not stopped:
+                logger.error("停止磁盘配额容器 %s 失败", container.name)
+                continue
+            marked = _mark_stopped_if_running(db, container.id, "disk_quota", now)
+            if not marked:
+                continue
+            _send_notify(f"【Lab-GPU】用户 {user.username} 的容器 {marked.name} 因工作区超过磁盘配额 {DISK_QUOTA_GRACE_HOURS} 小时，已停止。")
+        except Exception as exc:
+            db.rollback()
+            logger.exception("停止磁盘配额容器 %s 失败: %s", container.name, exc)
+
+
+def _enforce_disk_quotas():
+    db = SessionLocal()
+    try:
+        now = datetime.now()
+        grace_period = timedelta(hours=DISK_QUOTA_GRACE_HOURS)
+        users = db.query(UserModel).filter(UserModel.role == "user").all()
+        for user in users:
+            try:
+                status = refresh_user_quota(db, user, now=now)
+                if not status.scan_complete:
+                    continue
+                if not status.over_quota or not status.exceeded_since:
+                    continue
+                if now - status.exceeded_since < grace_period:
+                    continue
+                _stop_disk_quota_containers(db, user, now)
+            except Exception as exc:
+                db.rollback()
+                logger.exception("处理用户 %s 磁盘配额失败: %s", getattr(user, "username", getattr(user, "id", "unknown")), exc)
+    except Exception as exc:
+        logger.exception("磁盘配额检查失败: %s", exc)
+    finally:
+        db.close()
+
+
+_check_disk_quotas = _enforce_disk_quotas
+
+
 def _check_expiry_and_notify():
     db = SessionLocal()
     try:
@@ -158,12 +226,9 @@ def _stop_expired_containers():
         for c in db.query(ContainerModel).filter(ContainerModel.status == "running").all():
             if c.expires_at and c.expires_at <= now and c.container_id:
                 if stop_container(c.container_id):
-                    c.status = "stopped"
-                    c.stopped_at = now
-                    c.gpu_idle_low_since = None
-                    c.gpu_idle_last_sample_at = None
-                    db.commit()
-                    _send_notify(f"【Lab-GPU】容器 {c.name} 已到期，已执行停止。")
+                    marked = _mark_stopped_if_running(db, c.id, "expired", now)
+                    if marked:
+                        _send_notify(f"【Lab-GPU】容器 {marked.name} 已到期，已执行停止。")
     except Exception as e:
         logger.exception("停用过期容器失败: %s", e)
     finally:
@@ -285,9 +350,18 @@ def _reclaim_idle_gpu_containers():
 
 
 def start_scheduler():
+    if scheduler.running:
+        return
     scheduler.add_job(_check_expiry_and_notify, IntervalTrigger(minutes=30), id="notify", max_instances=1, coalesce=True)
     scheduler.add_job(_stop_expired_containers, IntervalTrigger(minutes=5), id="stop", max_instances=1, coalesce=True)
     scheduler.add_job(_remove_stopped_containers, IntervalTrigger(hours=1), id="remove", max_instances=1, coalesce=True)
+    scheduler.add_job(_enforce_disk_quotas, IntervalTrigger(minutes=DISK_QUOTA_SCAN_INTERVAL_MINUTES), id="disk-quota", max_instances=1, coalesce=True)
     scheduler.add_job(_reclaim_idle_gpu_containers, IntervalTrigger(minutes=5), id="idle-gpu-reclaim", max_instances=1, coalesce=True)
     scheduler.start()
     logger.info("定时任务已启动")
+
+
+def stop_scheduler():
+    if scheduler.running:
+        scheduler.shutdown(wait=False)
+        logger.info("定时任务已停止")

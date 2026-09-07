@@ -57,6 +57,7 @@ interface Container {
   ssh_password?: string | null;
   extra_ports?: Record<string, number> | null;
   status: string;
+  stop_reason?: string | null;
   expires_at: string;
   owner_username: string;
   created_at: string;
@@ -160,11 +161,12 @@ export default function MyContainers() {
     );
   };
 
-  const statusText = (s: string) => {
-    if (s === "running") return "运行中";
-    if (s === "pending_share_approval") return "待使用者同意";
-    if (s === "share_rejected") return "共用申请被拒绝";
-    if (s === "stopped") return "已停止";
+  const statusText = (container: Container) => {
+    if (container.status === "running") return "运行中";
+    if (container.status === "pending_share_approval") return "待使用者同意";
+    if (container.status === "share_rejected") return "共用申请被拒绝";
+    if (container.status === "stopped" && container.stop_reason === "disk_quota") return "空间超限停止";
+    if (container.status === "stopped") return "已停止";
     return "已清理";
   };
 
@@ -199,7 +201,14 @@ export default function MyContainers() {
               {containers.map((c) => (
                 <tr key={c.id} className={`status-${c.status}`}>
                   <td className="col-name">{c.name}</td>
-                  <td><span className={`status-badge ${c.status}`}>{statusText(c.status)}</span></td>
+                  <td>
+                    <span className={`status-badge ${c.status} ${c.stop_reason === "disk_quota" ? "quota-stopped" : ""}`}>
+                      {statusText(c)}
+                    </span>
+                    {c.stop_reason === "disk_quota" && (
+                      <small className="quota-stop-hint">请清理工作区后再申请</small>
+                    )}
+                  </td>
                   <td>{c.gpu_ids ? `GPU ${c.gpu_ids}` : "纯 CPU"}</td>
                   <td className="col-mono">{c.ssh_port}</td>
                   <td className="col-ports">

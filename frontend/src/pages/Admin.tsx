@@ -12,6 +12,13 @@ interface User {
   approved: boolean;
   role: string;
   created_at: string;
+  disk_quota_bytes: number;
+  disk_usage_bytes: number;
+  disk_quota_blocked: boolean;
+  disk_quota_exceeded_since?: string | null;
+  scan_complete: boolean;
+  usage_checked_at?: string | null;
+  quota_exempt?: boolean;
 }
 
 interface PendingUser {
@@ -31,6 +38,7 @@ interface Container {
   extra_ports?: Record<string, number> | null;
   ssh_password?: string | null;
   status: string;
+  stop_reason?: string | null;
   expires_at: string;
   owner_username: string;
 }
@@ -54,6 +62,20 @@ const defaultSettings: SystemSettings = {
   idle_gpu_memory_threshold_percent: 5,
   idle_gpu_duration_hours: 24,
 };
+
+const GIB = 1024 ** 3;
+
+function formatBytes(bytes: number): string {
+  if (bytes >= GIB) return `${(bytes / GIB).toFixed(1)} GiB`;
+  if (bytes >= 1024 ** 2) return `${(bytes / 1024 ** 2).toFixed(1)} MiB`;
+  if (bytes >= 1024) return `${(bytes / 1024).toFixed(1)} KiB`;
+  return `${bytes} B`;
+}
+
+function usagePercent(user: User): number {
+  if (!user.disk_quota_bytes) return 0;
+  return Math.min(100, (user.disk_usage_bytes / user.disk_quota_bytes) * 100);
+}
 
 // ---- 通知组件 ----
 type ToastType = "success" | "error" | "info";
@@ -116,6 +138,9 @@ export default function Admin() {
   const [newUser, setNewUser] = useState({ username: "", password: "", display_name: "" });
   const [loading, setLoading] = useState(false);
   const [createError, setCreateError] = useState("");
+  const [quotaDrafts, setQuotaDrafts] = useState<Record<number, string>>({});
+  const [quotaSaving, setQuotaSaving] = useState<number | null>(null);
+  const [quotaRefreshing, setQuotaRefreshing] = useState<number | null>(null);
 
   // 资源配额
   const [settings, setSettings] = useState<SystemSettings>(defaultSettings);
@@ -142,6 +167,10 @@ export default function Admin() {
   const loadUsers = async () => {
     const data = await fetcher<User[]>("/admin/users");
     setUsers(data);
+    setQuotaDrafts(data.reduce<Record<number, string>>((drafts, user) => {
+      drafts[user.id] = (user.disk_quota_bytes / GIB).toString();
+      return drafts;
+    }, {}));
   };
 
   const loadPendingUsers = async () => {
@@ -241,6 +270,40 @@ export default function Admin() {
         pushToast(e instanceof Error ? e.message : "删除失败", "error");
       }
     });
+  };
+
+  const handleSaveQuota = async (userId: number) => {
+    const quotaGib = Number(quotaDrafts[userId]);
+    if (!Number.isFinite(quotaGib) || quotaGib <= 0) {
+      pushToast("磁盘配额必须是大于 0 的数字", "error");
+      return;
+    }
+    setQuotaSaving(userId);
+    try {
+      await fetcher(`/admin/users/${userId}/quota`, {
+        method: "PUT",
+        body: JSON.stringify({ quota_gib: quotaGib }),
+      });
+      await loadUsers();
+      pushToast("磁盘配额已更新", "success");
+    } catch (e) {
+      pushToast(e instanceof Error ? e.message : "磁盘配额更新失败", "error");
+    } finally {
+      setQuotaSaving(null);
+    }
+  };
+
+  const handleRefreshQuota = async (userId: number) => {
+    setQuotaRefreshing(userId);
+    try {
+      await fetcher(`/admin/users/${userId}/quota/refresh`, { method: "POST" });
+      await loadUsers();
+      pushToast("磁盘使用量已刷新", "success");
+    } catch (e) {
+      pushToast(e instanceof Error ? e.message : "磁盘使用量刷新失败", "error");
+    } finally {
+      setQuotaRefreshing(null);
+    }
   };
 
   const handleSaveSettings = async (e: React.FormEvent) => {
@@ -471,7 +534,10 @@ export default function Admin() {
               <th>用户名</th>
               <th>实名</th>
               <th>联系方式</th>
-              <th>状态</th>
+              <th>审批状态</th>
+              <th>磁盘使用</th>
+              <th>磁盘配额</th>
+              <th>配额状态</th>
               <th>角色</th>
               <th>操作</th>
             </tr>
@@ -484,6 +550,57 @@ export default function Admin() {
                 <td>{u.real_name ?? "-"}</td>
                 <td>{u.contact_value ? (u.contact_type === "wechat" ? "微信 " : "手机 ") + u.contact_value : "-"}</td>
                 <td>{u.approved ? "已通过" : "待审批"}</td>
+                <td>
+                  <div className="quota-usage-cell">
+                    <span>{formatBytes(u.disk_usage_bytes)} / {formatBytes(u.disk_quota_bytes)}</span>
+                    {!u.quota_exempt && (
+                      <span className="quota-meter"><span style={{ width: `${usagePercent(u)}%` }} /></span>
+                    )}
+                  </div>
+                </td>
+                <td>
+                  {u.quota_exempt ? (
+                    "不受限"
+                  ) : (
+                    <div className="quota-editor">
+                      <input
+                        type="number"
+                        min="0.1"
+                        step="0.1"
+                        value={quotaDrafts[u.id] ?? ""}
+                        onChange={(e) => setQuotaDrafts((drafts) => ({ ...drafts, [u.id]: e.target.value }))}
+                      />
+                      <span>GiB</span>
+                      <button
+                        type="button"
+                        className="btn btn-small"
+                        onClick={() => handleSaveQuota(u.id)}
+                        disabled={quotaSaving === u.id || quotaRefreshing === u.id}
+                      >
+                        {quotaSaving === u.id ? "保存中" : "保存"}
+                      </button>
+                      <button
+                        type="button"
+                        className="btn btn-small"
+                        onClick={() => handleRefreshQuota(u.id)}
+                        disabled={quotaSaving === u.id || quotaRefreshing === u.id}
+                      >
+                        {quotaRefreshing === u.id ? "检测中" : "刷新"}
+                      </button>
+                    </div>
+                  )}
+                </td>
+                <td>
+                  <span className={`quota-status ${u.disk_quota_blocked ? "blocked" : "normal"}`}>
+                    {u.quota_exempt ? "管理员豁免" : !u.scan_complete ? "检测失败，已暂停申请" : u.disk_quota_blocked ? "已禁止申请" : "正常"}
+                  </span>
+                  {!u.quota_exempt && u.usage_checked_at && (
+                    <small className="quota-since">检测于 {new Date(u.usage_checked_at).toLocaleString()}</small>
+                  )}
+                  {u.disk_quota_exceeded_since && !u.quota_exempt && (
+                    <small className="quota-since">{new Date(u.disk_quota_exceeded_since).toLocaleString()} 起超限</small>
+                  )}
+                </td>
                 <td>{u.role}</td>
                 <td>
                   {u.role !== "admin" && (
@@ -539,7 +656,10 @@ export default function Admin() {
                     "-"
                   )}
                 </td>
-                <td>{c.status}</td>
+                <td>
+                  {c.status}
+                  {c.stop_reason === "disk_quota" && <small className="quota-since">空间超限</small>}
+                </td>
                 <td>{c.owner_username}</td>
                 <td>{new Date(c.expires_at).toLocaleString()}</td>
                 <td>
