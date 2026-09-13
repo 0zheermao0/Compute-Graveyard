@@ -10,10 +10,6 @@ from fastapi import APIRouter, Depends, HTTPException
 from app.auth import get_current_user
 from app.database import get_db
 from app.database_models import ContainerModel, UserModel
-from app.docker_service import (
-    create_container,
-    allocate_ssh_port,
-)
 from app.models import (
     ContainerApplyRequest,
     ContainerApplyResult,
@@ -30,7 +26,12 @@ from app.config import (
     DEFAULT_CPU_MEM_GB,
     DEFAULT_GPU_MEM_GB_PER_GPU,
     DEFAULT_MAX_GPU_SHARING_USERS,
+    NODE_ID,
+    NODE_NAME,
+    NODE_PUBLIC_HOST,
 )
+from app.node_service import build_service_url, delete_provisioned_container, get_node, provision_on_node, select_node
+from app.remote_agent import RemoteAgentError
 from app.database import get_setting
 from app.quota_service import check_user_can_provision
 
@@ -51,11 +52,11 @@ def _max_gpu_sharing(db) -> int:
     return max(1, v)
 
 
-def _distinct_users_per_gpu_map(db) -> dict[int, set[int]]:
+def _distinct_users_per_gpu_map(db, node_id: str = NODE_ID) -> dict[int, set[int]]:
     from collections import defaultdict
 
     m = defaultdict(set)
-    for c in db.query(ContainerModel).filter(ContainerModel.status == "running").all():
+    for c in db.query(ContainerModel).filter(ContainerModel.status == "running", ContainerModel.node_id == node_id).all():
         if not c.gpu_ids:
             continue
         for gid in map(int, c.gpu_ids.split(",")):
@@ -76,11 +77,11 @@ def _capacity_ok(gpu_ids: list[int], applicant_id: int, max_share: int, users_pe
     return True
 
 
-def _occupiers_for_gpus(db, gpu_ids: list[int], applicant_id: int) -> list[tuple[int, str]]:
+def _occupiers_for_gpus(db, gpu_ids: list[int], applicant_id: int, node_id: str = NODE_ID) -> list[tuple[int, str]]:
     """在所选 GPU 上有运行中容器的其他用户（需征求同意），按 user_id 排序。"""
     seen: dict[int, str] = {}
     want = set(gpu_ids)
-    for c in db.query(ContainerModel).filter(ContainerModel.status == "running").all():
+    for c in db.query(ContainerModel).filter(ContainerModel.status == "running", ContainerModel.node_id == node_id).all():
         if c.user_id == applicant_id or not c.gpu_ids:
             continue
         cg = set(int(x) for x in c.gpu_ids.split(","))
@@ -125,6 +126,11 @@ def _response_from_container(db, c: ContainerModel, owner_username: str | None =
         u = db.query(UserModel).filter(UserModel.id == c.user_id).first()
         uname = u.username if u else ""
 
+    access_host = c.access_host or NODE_PUBLIC_HOST
+    service_scheme = getattr(c, "service_scheme", None) or "http"
+    service_urls = None
+    if c.status == "running" and access_host and ep_int:
+        service_urls = {str(port): build_service_url(service_scheme, access_host, host_port) for port, host_port in ep_int.items()}
     return ContainerResponse(
         id=c.id,
         name=c.name,
@@ -140,6 +146,13 @@ def _response_from_container(db, c: ContainerModel, owner_username: str | None =
         created_at=c.created_at,
         share_approvers=share_list,
         pending_lease_days=pending_days,
+        node_id=c.node_id or NODE_ID,
+        node_name=c.node_name or NODE_NAME,
+        access_host=access_host,
+        service_scheme=service_scheme,
+        ssh_host=access_host,
+        ssh_url=f"ssh://{access_host}:{c.ssh_port}" if c.ssh_port else None,
+        service_urls=service_urls,
     )
 
 
@@ -164,14 +177,14 @@ def _provision_running_container(db, c: ContainerModel, lease_days: int) -> None
     if total_gpus + len(gpu_ids) > MAX_GPUS_PER_USER:
         raise HTTPException(status_code=400, detail=f"每人最多使用 {MAX_GPUS_PER_USER} 块 GPU")
 
-    users_per_gpu = _distinct_users_per_gpu_map(db)
+    users_per_gpu = _distinct_users_per_gpu_map(db, c.node_id or NODE_ID)
     mx = _max_gpu_sharing(db)
     if not _capacity_ok(gpu_ids, c.user_id, mx, users_per_gpu):
         raise HTTPException(status_code=400, detail="审批完成时 GPU 已无可用共用名额，请申请人重新申请")
 
-    ssh_port = allocate_ssh_port()
-    if not ssh_port:
-        raise HTTPException(status_code=500, detail="暂无可用 SSH 端口")
+    node = get_node(db, c.node_id or NODE_ID)
+    if not node:
+        raise HTTPException(status_code=500, detail="目标节点不存在")
 
     if gpu_ids:
         gpu_mem_gb_per_gpu = int(get_setting("gpu_mem_gb_per_gpu", str(DEFAULT_GPU_MEM_GB_PER_GPU)))
@@ -180,34 +193,37 @@ def _provision_running_container(db, c: ContainerModel, lease_days: int) -> None
         mem_limit_gb = int(get_setting("cpu_mem_gb", str(DEFAULT_CPU_MEM_GB)))
 
     prefix = "labcpu" if not gpu_ids else "labgpu"
-    safe_name = f"{prefix}-{user.username}-{datetime.now().strftime('%Y%m%d%H%M')}"
+    safe_name = f"{prefix}-{user.username}-{datetime.now().strftime('%Y%m%d%H%M')}-{uuid.uuid4().hex[:8]}"
 
     try:
-        container_id, ssh_password, extra_ports = create_container(
-            name=safe_name,
-            username=user.username,
-            gpu_ids=gpu_ids,
-            ssh_port=ssh_port,
-            mem_limit_gb=mem_limit_gb,
-        )
-    except RuntimeError as e:
+        provisioned = provision_on_node(node, safe_name, user.username, gpu_ids, mem_limit_gb)
+    except (RuntimeError, RemoteAgentError) as e:
         raise HTTPException(status_code=500, detail=str(e)) from e
 
+    extra_ports = provisioned.get("extra_ports") or {}
     extra_ports_json = json.dumps({str(k): v for k, v in extra_ports.items()}) if extra_ports else None
     expires_at = datetime.now() + timedelta(days=lease_days)
 
     c.name = safe_name
-    c.container_id = container_id
-    c.ssh_port = ssh_port
-    c.ssh_password = ssh_password
+    c.container_id = provisioned.get("container_id")
+    c.ssh_port = int(provisioned.get("ssh_port") or 0)
+    c.ssh_password = provisioned.get("ssh_password")
+    c.access_host = provisioned.get("access_host") or node.public_host
+    c.service_scheme = provisioned.get("service_scheme") or "http"
     c.extra_ports = extra_ports_json
     c.status = "running"
     c.pending_share_json = None
     c.expires_at = expires_at
-    db.commit()
+    try:
+        db.commit()
+    except Exception:
+        db.rollback()
+        delete_provisioned_container(node, str(provisioned["container_id"]))
+        raise
 
 
 @router.post("/apply", response_model=ContainerApplyResult)
+@_synchronized_share_action
 def apply_container(req: ContainerApplyRequest, user=Depends(get_current_user), db=Depends(get_db)):
     if user.role not in ("user", "admin"):
         raise HTTPException(status_code=403, detail="无权限申请")
@@ -241,22 +257,40 @@ def apply_container(req: ContainerApplyRequest, user=Depends(get_current_user), 
             raise HTTPException(status_code=400, detail=f"每人最多使用 {MAX_GPUS_PER_USER} 块 GPU")
 
     mx = _max_gpu_sharing(db)
-    users_per_gpu = _distinct_users_per_gpu_map(db)
+    try:
+        node, _ = select_node(
+            db,
+            req.placement_mode,
+            req.node_id,
+            gpu_ids,
+            req.cpu_only,
+            applicant_id=user.id,
+            max_share=mx,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except RemoteAgentError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    users_per_gpu = _distinct_users_per_gpu_map(db, node.id)
     if not _capacity_ok(gpu_ids, user.id, mx, users_per_gpu):
         raise HTTPException(status_code=400, detail="所选 GPU 已达到共用人数上限，请稍后再试或选择其他卡")
 
-    occupiers = _occupiers_for_gpus(db, gpu_ids, user.id)
+    occupiers = _occupiers_for_gpus(db, gpu_ids, user.id, node.id)
 
     if occupiers:
         approvers = [{"user_id": uid, "username": uname, "approved": False, "approved_at": None} for uid, uname in occupiers]
         payload = {"lease_days": req.lease_days, "approvers": approvers}
-        pend_name = f"labgpu-{user.username}-pend-{datetime.now().strftime('%Y%m%d%H%M')}"
+        pend_name = f"labgpu-{user.username}-pend-{datetime.now().strftime('%Y%m%d%H%M')}-{uuid.uuid4().hex[:8]}"
         pending_cid = f"pending-{uuid.uuid4().hex}"
         far_expires = datetime.now() + timedelta(days=3650)
         c = ContainerModel(
             container_id=pending_cid,
             name=pend_name,
             user_id=user.id,
+            node_id=node.id,
+            node_name=node.name,
+            access_host=node.public_host or NODE_PUBLIC_HOST,
             gpu_ids=",".join(map(str, sorted(gpu_ids))),
             ssh_port=0,
             ssh_password=None,
@@ -274,13 +308,9 @@ def apply_container(req: ContainerApplyRequest, user=Depends(get_current_user), 
             message="所选 GPU 上有其他同学的容器，已向对方发起共用申请，全部同意后自动创建",
         )
 
-    ssh_port = allocate_ssh_port()
-    if not ssh_port:
-        raise HTTPException(status_code=500, detail="暂无可用 SSH 端口")
-
     expires_at = datetime.now() + timedelta(days=req.lease_days)
     prefix = "labcpu" if req.cpu_only else "labgpu"
-    container_name = f"{prefix}-{user.username}-{datetime.now().strftime('%Y%m%d%H%M')}"
+    container_name = f"{prefix}-{user.username}-{datetime.now().strftime('%Y%m%d%H%M')}-{uuid.uuid4().hex[:8]}"
 
     if gpu_ids:
         gpu_mem_gb_per_gpu = int(get_setting("gpu_mem_gb_per_gpu", str(DEFAULT_GPU_MEM_GB_PER_GPU)))
@@ -289,31 +319,35 @@ def apply_container(req: ContainerApplyRequest, user=Depends(get_current_user), 
         mem_limit_gb = int(get_setting("cpu_mem_gb", str(DEFAULT_CPU_MEM_GB)))
 
     try:
-        container_id, ssh_password, extra_ports = create_container(
-            name=container_name,
-            username=user.username,
-            gpu_ids=gpu_ids,
-            ssh_port=ssh_port,
-            mem_limit_gb=mem_limit_gb,
-        )
-    except RuntimeError as e:
+        provisioned = provision_on_node(node, container_name, user.username, gpu_ids, mem_limit_gb)
+    except (RuntimeError, RemoteAgentError) as e:
         raise HTTPException(status_code=500, detail=str(e)) from e
 
+    extra_ports = provisioned.get("extra_ports") or {}
     extra_ports_json = json.dumps({str(k): v for k, v in extra_ports.items()}) if extra_ports else None
     c = ContainerModel(
-        container_id=container_id,
+        container_id=provisioned.get("container_id"),
         name=container_name,
         user_id=user.id,
+        node_id=node.id,
+        node_name=node.name,
+        access_host=provisioned.get("access_host") or node.public_host or NODE_PUBLIC_HOST,
+        service_scheme=provisioned.get("service_scheme") or "http",
         gpu_ids=",".join(map(str, sorted(gpu_ids))) if gpu_ids else "",
-        ssh_port=ssh_port,
-        ssh_password=ssh_password,
+        ssh_port=int(provisioned.get("ssh_port") or 0),
+        ssh_password=provisioned.get("ssh_password"),
         extra_ports=extra_ports_json,
         status="running",
         expires_at=expires_at,
         pending_share_json=None,
     )
     db.add(c)
-    db.commit()
+    try:
+        db.commit()
+    except Exception:
+        db.rollback()
+        delete_provisioned_container(node, str(provisioned["container_id"]))
+        raise
     db.refresh(c)
 
     return ContainerApplyResult(

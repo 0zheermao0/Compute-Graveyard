@@ -7,7 +7,16 @@ from sqlalchemy.exc import DBAPIError
 from sqlalchemy.orm import sessionmaker, declarative_base
 from sqlalchemy.pool import StaticPool
 
-from app.config import DATABASE_URL, DATA_DIR, DEFAULT_DISK_QUOTA_BYTES
+from app.config import (
+    DATABASE_URL,
+    DATA_DIR,
+    DEFAULT_DISK_QUOTA_BYTES,
+    INITIAL_ADMIN_PASSWORD,
+    INITIAL_ADMIN_USERNAME,
+    NODE_ID,
+    NODE_NAME,
+    NODE_PUBLIC_HOST,
+)
 
 # 解析 sqlite 路径，确保使用绝对路径且目录存在
 _db_url = DATABASE_URL
@@ -41,6 +50,7 @@ def init_db():
     _migrate_pending_share_json()
     _migrate_disk_quota()
     _migrate_container_stop_reason()
+    _migrate_compute_nodes()
 
 
 def _migrate_pending_share_json():
@@ -114,6 +124,53 @@ def _migrate_container_stop_reason(bind=None):
     if bind is None:
         bind = engine
     _add_missing_columns(bind, "containers", {"stop_reason": "VARCHAR(64)"})
+
+
+def _migrate_compute_nodes(bind=None):
+    if bind is None:
+        bind = engine
+    _add_missing_columns(
+        bind,
+        "containers",
+        {
+            "node_id": "VARCHAR(64)",
+            "node_name": "VARCHAR(128)",
+            "access_host": "VARCHAR(255)",
+            "service_scheme": "VARCHAR(8)",
+        },
+    )
+    if inspect(bind).has_table("containers"):
+        with bind.begin() as conn:
+            conn.execute(text("UPDATE containers SET node_id = :node_id WHERE node_id IS NULL OR node_id = ''"), {"node_id": NODE_ID})
+            conn.execute(text("UPDATE containers SET node_name = :node_name WHERE node_name IS NULL OR node_name = ''"), {"node_name": NODE_NAME})
+            conn.execute(text("UPDATE containers SET access_host = :host WHERE access_host IS NULL OR access_host = ''"), {"host": NODE_PUBLIC_HOST})
+            conn.execute(text("UPDATE containers SET service_scheme = 'http' WHERE service_scheme IS NULL OR service_scheme = ''"))
+    timestamp_type = "TIMESTAMP" if bind.dialect.name == "postgresql" else "DATETIME"
+    _add_missing_columns(
+        bind,
+        "compute_nodes",
+        {
+            "base_url": "VARCHAR(512) NOT NULL DEFAULT ''",
+            "public_host": "VARCHAR(255) NOT NULL DEFAULT ''",
+            "agent_token": "VARCHAR(512) NOT NULL DEFAULT ''",
+            "enabled": "BOOLEAN NOT NULL DEFAULT TRUE",
+            "schedulable": "BOOLEAN NOT NULL DEFAULT TRUE",
+            "last_seen_at": timestamp_type,
+            "created_at": timestamp_type,
+            "updated_at": timestamp_type,
+        },
+    )
+    if inspect(bind).has_table("compute_nodes"):
+        with bind.begin() as conn:
+            existing = conn.execute(text("SELECT id FROM compute_nodes WHERE id = :node_id"), {"node_id": NODE_ID}).first()
+            if existing is None:
+                conn.execute(
+                    text(
+                        "INSERT INTO compute_nodes (id, name, base_url, public_host, agent_token, enabled, schedulable, created_at, updated_at) "
+                        "VALUES (:id, :name, '', :host, '', :enabled, :schedulable, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
+                    ),
+                    {"id": NODE_ID, "name": NODE_NAME, "host": NODE_PUBLIC_HOST, "enabled": True, "schedulable": True},
+                )
 
 
 def _migrate_add_ssh_password():
@@ -236,15 +293,14 @@ def get_db():
 
 def create_default_admin():
     from app.database_models import UserModel
-    from app.auth import get_password_hash, verify_password
+    from app.auth import get_password_hash
     db = SessionLocal()
     try:
-        admin = db.query(UserModel).filter(UserModel.username == "admin").first()
-        if not admin:
-            correct_hash = get_password_hash("admin123")
+        admin = db.query(UserModel).filter(UserModel.role == "admin").first()
+        if not admin and db.query(UserModel).count() == 0 and INITIAL_ADMIN_PASSWORD:
             admin = UserModel(
-                username="admin",
-                hashed_password=correct_hash,
+                username=INITIAL_ADMIN_USERNAME,
+                hashed_password=get_password_hash(INITIAL_ADMIN_PASSWORD),
                 role="admin",
                 display_name="管理员",
                 approved=1,

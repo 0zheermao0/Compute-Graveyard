@@ -30,6 +30,11 @@ interface Container {
   status: string;
   ssh_password?: string | null;
   extra_ports?: Record<string, number> | null;
+  service_urls?: Record<string, string> | null;
+  access_host?: string | null;
+  ssh_host?: string | null;
+  node_id?: string | null;
+  node_name?: string | null;
 }
 
 interface QuotaStatus {
@@ -194,7 +199,7 @@ export default function Workspace() {
   const handleOpenVSCode = async (path: string) => {
     try {
       const data = await fetcher<Container[]>("/containers/my");
-      const running = data.filter(c => c.status === "running" && c.extra_ports?.["8080"]);
+      const running = data.filter((container) => container.status === "running" && (container.service_urls?.["8080"] || ((container.access_host || container.ssh_host) && container.extra_ports?.["8080"])));
       if (running.length === 0) {
         alert("没有正在运行的容器（需包含 Code Server）。请先到资源看板申请容器。");
         return;
@@ -212,8 +217,9 @@ export default function Workspace() {
   };
 
   const openVSCodeWithContainer = async (container: Container, path: string) => {
-    const port = container.extra_ports?.["8080"];
-    if (!port) return;
+    const host = container.access_host || container.ssh_host;
+    const serviceUrl = container.service_urls?.["8080"] || (host && container.extra_ports?.["8080"] ? `http://${host}:${container.extra_ports["8080"]}` : null);
+    if (!serviceUrl) return;
 
     if (container.ssh_password) {
       try {
@@ -225,8 +231,9 @@ export default function Workspace() {
     }
 
     const folder = `/workspace/${path.replace(/\/+$/, "")}`;
-    const url = `${window.location.protocol}//${window.location.hostname}:${port}/?folder=${encodeURIComponent(folder)}`;
-    window.open(url, "_blank");
+    const url = new URL(serviceUrl);
+    url.searchParams.set("folder", folder);
+    window.open(url.toString(), "_blank");
     setShowContainerModal(false);
   };
 
@@ -435,7 +442,7 @@ export default function Workspace() {
                   >
                     <span style={{ fontSize: '1.1rem', marginRight: '0.5rem' }}>🚀</span>
                     <strong>{c.name}</strong>
-                    <span style={{ marginLeft: 'auto', opacity: 0.6, fontSize: '0.8rem', float: 'right' }}>端口: {c.extra_ports?.["8080"]}</span>
+                    <span style={{ marginLeft: 'auto', opacity: 0.6, fontSize: '0.8rem', float: 'right' }}>{c.node_name || c.node_id || "本机"}</span>
                   </button>
                 ))}
               </div>

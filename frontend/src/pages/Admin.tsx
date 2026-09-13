@@ -36,11 +36,13 @@ interface Container {
   gpu_ids: string;
   ssh_port: number;
   extra_ports?: Record<string, number> | null;
-  ssh_password?: string | null;
   status: string;
   stop_reason?: string | null;
   expires_at: string;
   owner_username: string;
+  node_id?: string | null;
+  node_name?: string | null;
+  access_host?: string | null;
 }
 
 interface SystemSettings {
@@ -52,6 +54,76 @@ interface SystemSettings {
   idle_gpu_memory_threshold_percent: number;
   idle_gpu_duration_hours: number;
 }
+
+interface GPUInfo {
+  index: number;
+  name: string;
+  memory_used_mb?: number | null;
+  memory_total_mb?: number | null;
+  memory_percent?: number | null;
+  temperature?: number | null;
+  utilization?: number | null;
+}
+
+interface SystemLoad {
+  cpu_percent: number;
+  memory_used_gb: number;
+  memory_total_gb: number;
+  memory_percent: number;
+  disk_free_gb: number;
+  disk_total_gb: number;
+}
+
+interface ComputeNode {
+  id: string;
+  name: string;
+  base_url: string;
+  public_host: string;
+  enabled: boolean;
+  schedulable: boolean;
+  last_seen_at?: string | null;
+  created_at: string;
+  updated_at: string;
+  has_agent_token: boolean;
+  is_local: boolean;
+}
+
+interface NodeInventory {
+  node_id: string;
+  node_name: string;
+  public_host: string;
+  role: string;
+  gpus: GPUInfo[];
+  system_load: SystemLoad;
+  containers: Array<{ status: string }>;
+}
+
+interface NodeInventoryResult {
+  node: ComputeNode;
+  online: boolean;
+  inventory: NodeInventory | null;
+  error?: string | null;
+}
+
+interface NodeDraft {
+  id: string;
+  name: string;
+  base_url: string;
+  public_host: string;
+  agent_token: string;
+  enabled: boolean;
+  schedulable: boolean;
+}
+
+const emptyNodeDraft: NodeDraft = {
+  id: "",
+  name: "",
+  base_url: "",
+  public_host: "",
+  agent_token: "",
+  enabled: true,
+  schedulable: true,
+};
 
 const defaultSettings: SystemSettings = {
   cpu_mem_gb: 8,
@@ -141,6 +213,12 @@ export default function Admin() {
   const [quotaDrafts, setQuotaDrafts] = useState<Record<number, string>>({});
   const [quotaSaving, setQuotaSaving] = useState<number | null>(null);
   const [quotaRefreshing, setQuotaRefreshing] = useState<number | null>(null);
+  const [nodes, setNodes] = useState<ComputeNode[]>([]);
+  const [nodeInventories, setNodeInventories] = useState<Record<string, NodeInventoryResult>>({});
+  const [nodeDraft, setNodeDraft] = useState<NodeDraft>(emptyNodeDraft);
+  const [editingNodeId, setEditingNodeId] = useState<string | null>(null);
+  const [nodeSaving, setNodeSaving] = useState(false);
+  const [nodeTesting, setNodeTesting] = useState<string | null>(null);
 
   // 资源配额
   const [settings, setSettings] = useState<SystemSettings>(defaultSettings);
@@ -183,6 +261,18 @@ export default function Admin() {
     setContainers(data);
   };
 
+  const loadNodes = async () => {
+    const [nodeRows, inventoryRows] = await Promise.all([
+      fetcher<ComputeNode[]>("/admin/nodes"),
+      fetcher<NodeInventoryResult[]>("/admin/nodes/inventory"),
+    ]);
+    setNodes(nodeRows);
+    setNodeInventories(inventoryRows.reduce<Record<string, NodeInventoryResult>>((result, row) => {
+      result[row.node.id] = row;
+      return result;
+    }, {}));
+  };
+
   const loadSettings = async () => {
     setSettingsError("");
     try {
@@ -202,8 +292,97 @@ export default function Admin() {
     loadUsers();
     loadPendingUsers();
     loadContainers();
+    loadNodes().catch((e) => pushToast(e instanceof Error ? e.message : "节点加载失败", "error"));
     loadSettings();
   }, []);
+
+  const handleSaveNode = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setNodeSaving(true);
+    try {
+      const payload = {
+        name: nodeDraft.name,
+        base_url: nodeDraft.base_url,
+        public_host: nodeDraft.public_host,
+        enabled: nodeDraft.enabled,
+        schedulable: nodeDraft.schedulable,
+        ...(nodeDraft.agent_token ? { agent_token: nodeDraft.agent_token } : {}),
+      };
+      if (editingNodeId) {
+        await fetcher(`/admin/nodes/${encodeURIComponent(editingNodeId)}`, {
+          method: "PATCH",
+          body: JSON.stringify(payload),
+        });
+      } else {
+        await fetcher("/admin/nodes", {
+          method: "POST",
+          body: JSON.stringify({ id: nodeDraft.id, ...payload }),
+        });
+      }
+      setNodeDraft(emptyNodeDraft);
+      setEditingNodeId(null);
+      await loadNodes();
+      pushToast(editingNodeId ? "节点已更新" : "节点已添加", "success");
+    } catch (e) {
+      pushToast(e instanceof Error ? e.message : "节点保存失败", "error");
+    } finally {
+      setNodeSaving(false);
+    }
+  };
+
+  const handleEditNode = (node: ComputeNode) => {
+    setEditingNodeId(node.id);
+    setNodeDraft({
+      id: node.id,
+      name: node.name,
+      base_url: node.base_url,
+      public_host: node.public_host,
+      agent_token: "",
+      enabled: node.enabled,
+      schedulable: node.schedulable,
+    });
+  };
+
+  const handleToggleNode = async (node: ComputeNode, field: "enabled" | "schedulable", value: boolean) => {
+    try {
+      await fetcher(`/admin/nodes/${encodeURIComponent(node.id)}`, {
+        method: "PATCH",
+        body: JSON.stringify({ [field]: value }),
+      });
+      await loadNodes();
+    } catch (e) {
+      pushToast(e instanceof Error ? e.message : "节点状态更新失败", "error");
+    }
+  };
+
+  const handleTestNode = async (nodeId: string) => {
+    setNodeTesting(nodeId);
+    try {
+      const result = await fetcher<{ ok: boolean; node: ComputeNode; inventory: NodeInventory }>(`/admin/nodes/${encodeURIComponent(nodeId)}/test`, { method: "POST" });
+      setNodeInventories((current) => ({
+        ...current,
+        [nodeId]: { node: result.node, online: result.ok, inventory: result.inventory, error: null },
+      }));
+      setNodes((current) => current.map((node) => node.id === nodeId ? result.node : node));
+      pushToast("节点连接正常", "success");
+    } catch (e) {
+      pushToast(e instanceof Error ? e.message : "节点连接失败", "error");
+    } finally {
+      setNodeTesting(null);
+    }
+  };
+
+  const handleDeleteNode = (node: ComputeNode) => {
+    askConfirm(`确定删除节点 "${node.name}" 吗？`, async () => {
+      try {
+        await fetcher(`/admin/nodes/${encodeURIComponent(node.id)}`, { method: "DELETE" });
+        await loadNodes();
+        pushToast("节点已删除", "success");
+      } catch (e) {
+        pushToast(e instanceof Error ? e.message : "节点删除失败", "error");
+      }
+    });
+  };
 
   const handleApprove = async (userId: number) => {
     try {
@@ -333,6 +512,88 @@ export default function Admin() {
       <Toast toasts={toasts} remove={removeToast} />
       <ConfirmDialog state={confirm} onCancel={closeConfirm} />
       <h1>管理后台</h1>
+
+      <section className="admin-section">
+        <h2>计算节点管理</h2>
+        <form onSubmit={handleSaveNode} className="node-form">
+          <input
+            placeholder="节点 ID"
+            value={nodeDraft.id}
+            disabled={Boolean(editingNodeId)}
+            onChange={(e) => setNodeDraft((draft) => ({ ...draft, id: e.target.value }))}
+            required
+          />
+          <input
+            placeholder="节点名称"
+            value={nodeDraft.name}
+            onChange={(e) => setNodeDraft((draft) => ({ ...draft, name: e.target.value }))}
+            required
+          />
+          <input
+            placeholder="Agent 地址，如 http://10.0.0.2:9000"
+            value={nodeDraft.base_url}
+            onChange={(e) => setNodeDraft((draft) => ({ ...draft, base_url: e.target.value }))}
+          />
+          <input
+            placeholder="公开访问主机名或 IP"
+            value={nodeDraft.public_host}
+            onChange={(e) => setNodeDraft((draft) => ({ ...draft, public_host: e.target.value }))}
+          />
+          <input
+            type="password"
+            placeholder={editingNodeId ? "Agent 令牌（留空不修改）" : "Agent 令牌"}
+            value={nodeDraft.agent_token}
+            onChange={(e) => setNodeDraft((draft) => ({ ...draft, agent_token: e.target.value }))}
+          />
+          <label className="node-check"><input type="checkbox" checked={nodeDraft.enabled} onChange={(e) => setNodeDraft((draft) => ({ ...draft, enabled: e.target.checked }))} />启用</label>
+          <label className="node-check"><input type="checkbox" checked={nodeDraft.schedulable} onChange={(e) => setNodeDraft((draft) => ({ ...draft, schedulable: e.target.checked }))} />可调度</label>
+          <div className="node-form-actions">
+            <button type="submit" className="btn btn-primary" disabled={nodeSaving}>{nodeSaving ? "保存中…" : editingNodeId ? "保存修改" : "添加节点"}</button>
+            {editingNodeId && <button type="button" className="btn btn-frosted" onClick={() => { setEditingNodeId(null); setNodeDraft(emptyNodeDraft); }}>取消编辑</button>}
+          </div>
+        </form>
+        {nodes.length === 0 ? (
+          <p className="admin-empty">暂无节点</p>
+        ) : (
+          <div className="node-grid">
+            {nodes.map((node) => {
+              const result = nodeInventories[node.id];
+              const inventory = result?.inventory;
+              return (
+                <article className="node-card" key={node.id}>
+                  <div className="node-card-header">
+                    <div>
+                      <strong>{node.name}</strong>
+                      <code>{node.id}</code>
+                    </div>
+                    <span className={`node-online ${result?.online ? "online" : "offline"}`}>{result?.online ? "在线" : result ? "离线" : node.enabled ? "未检测" : "已禁用"}</span>
+                  </div>
+                  <dl className="node-meta">
+                    <div><dt>Agent</dt><dd>{node.is_local ? "本机" : node.base_url || "-"}</dd></div>
+                    <div><dt>访问地址</dt><dd>{node.public_host || "-"}</dd></div>
+                    <div><dt>最近连接</dt><dd>{node.last_seen_at ? new Date(node.last_seen_at).toLocaleString() : "-"}</dd></div>
+                  </dl>
+                  <div className="node-resource-summary">
+                    <span>GPU <b>{inventory?.gpus.length ?? "-"}</b></span>
+                    <span>容器 <b>{inventory?.containers.length ?? "-"}</b></span>
+                    <span>CPU <b>{inventory ? `${inventory.system_load.cpu_percent}%` : "-"}</b></span>
+                    <span>内存 <b>{inventory ? `${inventory.system_load.memory_used_gb}/${inventory.system_load.memory_total_gb} GB` : "-"}</b></span>
+                  </div>
+                  {result?.error && <div className="node-error">{result.error}</div>}
+                  {inventory?.gpus.length ? <div className="node-gpu-list">{inventory.gpus.map((gpu) => <span key={gpu.index}>GPU {gpu.index} · {gpu.name} · {gpu.memory_percent ?? 0}%</span>)}</div> : null}
+                  <div className="node-controls">
+                    <label><input type="checkbox" checked={node.enabled} onChange={(e) => handleToggleNode(node, "enabled", e.target.checked)} />启用</label>
+                    <label><input type="checkbox" checked={node.schedulable} onChange={(e) => handleToggleNode(node, "schedulable", e.target.checked)} />可调度</label>
+                    <button type="button" className="btn btn-small" onClick={() => handleTestNode(node.id)} disabled={nodeTesting === node.id}>{nodeTesting === node.id ? "测试中" : "连接测试"}</button>
+                    <button type="button" className="btn btn-small" onClick={() => handleEditNode(node)}>编辑</button>
+                    {!node.is_local && <button type="button" className="btn btn-small btn-danger" onClick={() => handleDeleteNode(node)}>删除</button>}
+                  </div>
+                </article>
+              );
+            })}
+          </div>
+        )}
+      </section>
 
       {/* 资源配额设置 */}
       <section className="admin-section">
@@ -626,10 +887,10 @@ export default function Admin() {
           <thead>
             <tr>
               <th>名称</th>
+              <th>节点</th>
               <th>GPU</th>
               <th>SSH</th>
               <th>服务端口</th>
-              <th>密码</th>
               <th>状态</th>
               <th>用户</th>
               <th>到期</th>
@@ -640,21 +901,13 @@ export default function Admin() {
             {containers.map((c) => (
               <tr key={c.id}>
                 <td>{c.name}</td>
+                <td>{c.node_name || c.node_id || "本机"}</td>
                 <td>{c.gpu_ids || "CPU"}</td>
-                <td>{c.ssh_port}</td>
+                <td>{c.access_host ? `${c.access_host}:${c.ssh_port}` : c.ssh_port}</td>
                 <td>
                   {c.extra_ports
                     ? Object.entries(c.extra_ports).map(([k, v]) => `${k}→${v}`).join(" ")
                     : "-"}
-                </td>
-                <td>
-                  {c.ssh_password ? (
-                    <code title="点击复制" onClick={() => navigator.clipboard.writeText(c.ssh_password!)} style={{ cursor: "pointer" }}>
-                      {c.ssh_password}
-                    </code>
-                  ) : (
-                    "-"
-                  )}
                 </td>
                 <td>
                   {c.status}

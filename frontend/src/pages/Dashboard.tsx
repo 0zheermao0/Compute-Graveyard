@@ -4,7 +4,7 @@ import ApplyModal from "../components/ApplyModal";
 import GPUTwin from "../components/GPUTwin";
 import "./Dashboard.css";
 
-interface GPUInfo {
+export interface GPUInfo {
   index: number;
   name: string;
   memory_used_mb: number | null;
@@ -76,22 +76,40 @@ function quotaPercent(quota: QuotaStatus): number {
   return Math.min(100, quota.usage_bytes / quota.quota_bytes * 100);
 }
 
+interface SystemLoad {
+  cpu_percent: number;
+  memory_used_gb: number;
+  memory_total_gb: number;
+  memory_percent: number;
+  disk_free_gb: number;
+  disk_total_gb: number;
+}
+
+export interface DashboardNode {
+  node_id: string;
+  node_name: string;
+  online: boolean;
+  schedulable: boolean;
+  public_host?: string | null;
+  is_local: boolean;
+  gpus: GPUInfo[];
+  system_load?: SystemLoad | null;
+  container_count: number;
+  occupancies: Occupancy[];
+  gpu_sharing: GpuSharingStatus[];
+  error?: string | null;
+}
+
 interface DashboardData {
   gpus: GPUInfo[];
-  system_load: {
-    cpu_percent: number;
-    memory_used_gb: number;
-    memory_total_gb: number;
-    memory_percent: number;
-    disk_free_gb: number;
-    disk_total_gb: number;
-  };
+  system_load: SystemLoad;
   occupancies: Occupancy[];
   all_containers: RunningContainer[];
   weekly_ranking: UsageRankItem[];
   monthly_ranking: UsageRankItem[];
   gpu_sharing?: GpuSharingStatus[];
   max_gpu_sharing_users?: number;
+  nodes?: DashboardNode[];
 }
 
 export default function Dashboard() {
@@ -145,6 +163,22 @@ export default function Dashboard() {
   }, []);
 
   const ranking = rankMode === "weekly" ? (data?.weekly_ranking ?? []) : (data?.monthly_ranking ?? []);
+  const dashboardNodes: DashboardNode[] = data
+    ? data.nodes?.length
+      ? data.nodes
+      : [{
+          node_id: "local",
+          node_name: "本机节点",
+          online: true,
+          schedulable: true,
+          is_local: true,
+          gpus: data.gpus,
+          system_load: data.system_load,
+          container_count: data.all_containers.length,
+          occupancies: data.occupancies,
+          gpu_sharing: data.gpu_sharing ?? [],
+        }]
+    : [];
   const quotaBlocked = Boolean(quota && !quota.quota_exempt && (!quota.scan_complete || quota.blocked));
   const applyDisabled = quotaLoading || quotaError || quotaBlocked;
 
@@ -177,38 +211,51 @@ export default function Dashboard() {
 
       <div className="dashboard-body">
         <div className="dashboard-main">
-          {/* 系统负载 */}
-          {data?.system_load && (
+          {quota && !quota.quota_exempt && (
             <section className="system-load">
-              <h2>系统负载</h2>
+              <h2>个人空间</h2>
               <div className="load-cards">
-                <div className="load-card">
-                  <span className="load-label">CPU</span>
-                  <span className="load-value">{data.system_load.cpu_percent}%</span>
+                <div className={`load-card disk-quota-card ${quotaBlocked ? "over" : ""}`}>
+                  <span className="load-label">工作区用量</span>
+                  <span className="load-value">{formatGiB(quota.usage_bytes)} / {formatGiB(quota.quota_bytes)}</span>
+                  <span className="dashboard-quota-meter"><span style={{ width: `${quotaPercent(quota)}%` }} /></span>
                 </div>
-                <div className="load-card">
-                  <span className="load-label">内存</span>
-                  <span className="load-value">
-                    {data.system_load.memory_used_gb} / {data.system_load.memory_total_gb} GB ({data.system_load.memory_percent}%)
-                  </span>
-                </div>
-                <div className="load-card">
-                  <span className="load-label">工作区可用</span>
-                  <span className="load-value">{data.system_load.disk_free_gb} GB</span>
-                </div>
-                {quota && !quota.quota_exempt && (
-                  <div className={`load-card disk-quota-card ${quotaBlocked ? "over" : ""}`}>
-                    <span className="load-label">个人空间</span>
-                    <span className="load-value">{formatGiB(quota.usage_bytes)} / {formatGiB(quota.quota_bytes)}</span>
-                    <span className="dashboard-quota-meter"><span style={{ width: `${quotaPercent(quota)}%` }} /></span>
-                  </div>
-                )}
               </div>
             </section>
           )}
 
-          {/* GPU 数字孪生 */}
-          <GPUTwin gpus={data?.gpus ?? []} occupancies={data?.occupancies ?? []} />
+          <section className="dashboard-nodes">
+            <h2>计算节点</h2>
+            {dashboardNodes.map((node) => (
+              <article className={`dashboard-node ${node.online ? "online" : "offline"}`} key={node.node_id}>
+                <div className="dashboard-node-header">
+                  <div>
+                    <strong>{node.node_name}</strong>
+                    <code>{node.node_id}</code>
+                  </div>
+                  <div className="dashboard-node-badges">
+                    <span>{node.online ? "在线" : "离线"}</span>
+                    <span>{node.schedulable ? "可调度" : "不可调度"}</span>
+                    <span>{node.container_count} 个容器</span>
+                  </div>
+                </div>
+                {node.public_host && <div className="dashboard-node-host">{node.public_host}</div>}
+                {node.error && <div className="dashboard-node-error">{node.error}</div>}
+                {node.system_load && (
+                  <div className="load-cards dashboard-node-load">
+                    <div className="load-card"><span className="load-label">CPU</span><span className="load-value">{node.system_load.cpu_percent}%</span></div>
+                    <div className="load-card"><span className="load-label">内存</span><span className="load-value">{node.system_load.memory_used_gb} / {node.system_load.memory_total_gb} GB ({node.system_load.memory_percent}%)</span></div>
+                    <div className="load-card"><span className="load-label">磁盘可用</span><span className="load-value">{node.system_load.disk_free_gb} / {node.system_load.disk_total_gb} GB</span></div>
+                  </div>
+                )}
+                {node.online ? (
+                  <GPUTwin gpus={node.gpus} occupancies={node.occupancies} />
+                ) : (
+                  <div className="dashboard-node-unavailable">节点资源暂不可用</div>
+                )}
+              </article>
+            ))}
+          </section>
 
           {/* 全部运行中容器及联系方式 */}
           {data?.all_containers && data.all_containers.length > 0 && (
@@ -290,6 +337,7 @@ export default function Dashboard() {
       {showApply && (
         <ApplyModal
           gpuSharing={data?.gpu_sharing ?? []}
+          nodes={dashboardNodes}
           onClose={() => setShowApply(false)}
           onSuccess={() => {
             setShowApply(false);

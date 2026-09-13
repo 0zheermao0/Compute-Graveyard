@@ -6,11 +6,13 @@ from typing import Iterable, Mapping, Optional
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 
-from app.config import DISK_QUOTA_GRACE_HOURS, DISK_QUOTA_SCAN_INTERVAL_MINUTES, NOTIFY_WEBHOOK
+from app.config import DISK_QUOTA_GRACE_HOURS, DISK_QUOTA_SCAN_INTERVAL_MINUTES, NOTIFY_WEBHOOK, NODE_ID, NODE_ROLE
 from app.container_lifecycle import remove_container_record
 from app.database import SessionLocal
 from app.database_models import ContainerModel, SystemSettings, UserModel
-from app.docker_service import get_gpu_info, stop_container
+from app.docker_service import stop_container
+from app.node_service import get_node, inventory_for_node, stop_on_node
+from app.remote_agent import RemoteAgentError
 from app.quota_service import refresh_user_quota
 from app.settings_service import idle_policy_signature, load_settings
 
@@ -120,6 +122,7 @@ def _candidate_still_reclaimable(db, container_id: int, snapshot: dict, signatur
         and current_signature == signature
         and container.status == "running"
         and container.container_id == snapshot["container_id"]
+        and (getattr(container, "node_id", None) or NODE_ID) == snapshot.get("node_id", getattr(container, "node_id", None) or NODE_ID)
         and container.gpu_ids == snapshot["gpu_ids"]
         and container.gpu_idle_low_since == snapshot["low_since"]
         and container.gpu_idle_low_since is not None
@@ -129,6 +132,12 @@ def _candidate_still_reclaimable(db, container_id: int, snapshot: dict, signatur
         _clear_container_idle_window(db, container)
         return None, None
     return container, current_settings
+
+
+def _stop_container_runtime(db, container: ContainerModel) -> bool:
+    if not getattr(container, "node_id", None) or container.node_id == NODE_ID:
+        return stop_container(container.container_id)
+    return stop_on_node(db, container)
 
 
 def _mark_stopped_if_running(db, container_id: int, reason: str, now: datetime) -> Optional[ContainerModel]:
@@ -157,7 +166,7 @@ def _stop_disk_quota_containers(db, user: UserModel, now: datetime) -> None:
             logger.error("磁盘配额容器 %s 缺少 Docker ID，无法停止", container.name)
             continue
         try:
-            stopped = stop_container(container.container_id)
+            stopped = _stop_container_runtime(db, container)
             if not stopped:
                 logger.error("停止磁盘配额容器 %s 失败", container.name)
                 continue
@@ -225,7 +234,7 @@ def _stop_expired_containers():
         now = datetime.now()
         for c in db.query(ContainerModel).filter(ContainerModel.status == "running").all():
             if c.expires_at and c.expires_at <= now and c.container_id:
-                if stop_container(c.container_id):
+                if _stop_container_runtime(db, c):
                     marked = _mark_stopped_if_running(db, c.id, "expired", now)
                     if marked:
                         _send_notify(f"【Lab-GPU】容器 {marked.name} 已到期，已执行停止。")
@@ -274,16 +283,9 @@ def _reclaim_idle_gpu_containers():
             db.commit()
             return
 
-        gpu_rows = get_gpu_info()
-        if not gpu_rows:
-            _clear_idle_windows(db)
-            db.commit()
-            logger.warning("GPU 指标采集失败，本轮不会自动回收")
-            return
-
-        metrics_by_index = {row["index"]: row for row in gpu_rows}
         now = datetime.now()
         duration = timedelta(hours=settings.idle_gpu_duration_hours)
+        inventories: dict[str, dict | None] = {}
         containers = db.query(ContainerModel).filter(
             ContainerModel.status == "running",
             ContainerModel.container_id.isnot(None),
@@ -294,6 +296,24 @@ def _reclaim_idle_gpu_containers():
 
         for container in containers:
             try:
+                node_id = container.node_id or NODE_ID
+                if node_id not in inventories:
+                    node = get_node(db, node_id)
+                    if not node or not node.enabled:
+                        inventories[node_id] = None
+                    else:
+                        try:
+                            inventories[node_id] = inventory_for_node(db, node)
+                        except (RemoteAgentError, RuntimeError, ValueError) as exc:
+                            logger.warning("GPU 指标采集失败，节点 %s 本轮不会自动回收: %s", node_id, exc)
+                            inventories[node_id] = None
+                inventory = inventories[node_id]
+                if not inventory:
+                    container.gpu_idle_low_since = None
+                    container.gpu_idle_last_sample_at = None
+                    db.commit()
+                    continue
+                metrics_by_index = {int(row["index"]): row for row in inventory.get("gpus", [])}
                 gpu_ids = [int(value.strip()) for value in container.gpu_ids.split(",") if value.strip()]
                 is_low = gpu_set_is_low(
                     gpu_ids,
@@ -314,6 +334,7 @@ def _reclaim_idle_gpu_containers():
                     continue
                 snapshot = {
                     "container_id": container.container_id,
+                    "node_id": node_id,
                     "gpu_ids": container.gpu_ids,
                     "low_since": low_since,
                 }
@@ -350,7 +371,7 @@ def _reclaim_idle_gpu_containers():
 
 
 def start_scheduler():
-    if scheduler.running:
+    if NODE_ROLE == "worker" or scheduler.running:
         return
     scheduler.add_job(_check_expiry_and_notify, IntervalTrigger(minutes=30), id="notify", max_instances=1, coalesce=True)
     scheduler.add_job(_stop_expired_containers, IntervalTrigger(minutes=5), id="stop", max_instances=1, coalesce=True)

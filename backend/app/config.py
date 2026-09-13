@@ -38,4 +38,21 @@ if DISK_QUOTA_GRACE_HOURS <= 0:
     raise ValueError("DISK_QUOTA_GRACE_HOURS must be positive")
 JWT_SECRET = os.getenv("JWT_SECRET", "change-this-in-production")
 DATABASE_URL = os.getenv("DATABASE_URL", f"sqlite:///{DATA_DIR / 'lab_gpu.db'}")
+CORS_ORIGINS = [value.strip() for value in os.getenv("CORS_ORIGINS", "").split(",") if value.strip()]
 NOTIFY_WEBHOOK = os.getenv("NOTIFY_WEBHOOK", "")  # 钉钉/飞书 Webhook
+INITIAL_ADMIN_USERNAME = os.getenv("INITIAL_ADMIN_USERNAME", "admin").strip().lower()
+INITIAL_ADMIN_PASSWORD = os.getenv("INITIAL_ADMIN_PASSWORD", "")
+INIT_ADMIN_TOKEN = os.getenv("INIT_ADMIN_TOKEN", "").strip()
+NODE_ROLE = os.getenv("NODE_ROLE", "standalone").strip().lower()
+if NODE_ROLE not in {"standalone", "master", "worker"}:
+    raise ValueError("NODE_ROLE must be standalone, master, or worker")
+NODE_ID = os.getenv("NODE_ID", "local").strip() or "local"
+NODE_NAME = os.getenv("NODE_NAME", NODE_ID).strip() or NODE_ID
+NODE_PUBLIC_HOST = os.getenv("NODE_PUBLIC_HOST", "localhost").strip() or "localhost"
+NODE_SERVICE_SCHEME = os.getenv("NODE_SERVICE_SCHEME", "http").strip().lower()
+if NODE_SERVICE_SCHEME not in {"http", "https"}:
+    raise ValueError("NODE_SERVICE_SCHEME must be http or https")
+AGENT_API_TOKEN = os.getenv("AGENT_API_TOKEN", "").strip()
+AGENT_REQUEST_TIMEOUT_SECONDS = float(os.getenv("AGENT_REQUEST_TIMEOUT_SECONDS", "10"))
+if AGENT_REQUEST_TIMEOUT_SECONDS <= 0:
+    raise ValueError("AGENT_REQUEST_TIMEOUT_SECONDS must be positive")

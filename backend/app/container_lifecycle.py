@@ -44,7 +44,7 @@ def remove_container_record(
     container: ContainerModel,
     reason: str,
     now: Optional[datetime] = None,
-    docker_remover: Callable[[str], RemovalResult] = _remove_from_docker,
+    docker_remover: Optional[Callable[[str], RemovalResult]] = None,
     expected_status: Optional[str] = None,
     expected_container_id: Optional[str] = None,
     expected_gpu_ids: Optional[str] = None,
@@ -70,7 +70,13 @@ def remove_container_record(
     if not container.container_id:
         return RemovalResult(success=False, error="数据库记录缺少 Docker 容器 ID，无法确认容器已不存在")
 
-    result = docker_remover(container.container_id)
+    if docker_remover is None:
+        from app.node_service import delete_on_node
+        result = RemovalResult(success=delete_on_node(db, container))
+        if not result.success:
+            result.error = "节点容器删除失败"
+    else:
+        result = docker_remover(container.container_id)
     if not result.success:
         return result
 

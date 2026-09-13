@@ -9,16 +9,139 @@ from pydantic import BaseModel
 
 from app.auth import get_current_admin
 from app.database import get_db
-from app.database_models import UserModel, ContainerModel, LeaseRecordModel
-from app.docker_service import stop_container
+from app.database_models import UserModel, ContainerModel, LeaseRecordModel, ComputeNodeModel
 from app.models import UserCreate, UserResponse
 from app.auth import get_password_hash
 from app.container_lifecycle import remove_container_record
 from app.settings_service import SettingsValues, load_settings, save_settings
-from app.config import DEFAULT_DISK_QUOTA_BYTES
+from app.config import DEFAULT_DISK_QUOTA_BYTES, NODE_ID, NODE_ROLE
+from app.node_service import aggregate_inventories, inventory_for_node, node_response, normalize_public_host, stop_on_node
+from app.remote_agent import RemoteAgentError, normalize_agent_base_url
 from app.quota_service import quota_status, quota_status_payload, refresh_user_quota
 
 router = APIRouter()
+
+
+class ComputeNodeRequest(BaseModel):
+    id: str
+    name: str
+    base_url: str = ""
+    public_host: str = ""
+    agent_token: Optional[str] = None
+    enabled: bool = True
+    schedulable: bool = True
+
+
+class ComputeNodeUpdate(BaseModel):
+    name: Optional[str] = None
+    base_url: Optional[str] = None
+    public_host: Optional[str] = None
+    agent_token: Optional[str] = None
+    enabled: Optional[bool] = None
+    schedulable: Optional[bool] = None
+
+
+def _require_master():
+    if NODE_ROLE not in {"standalone", "master"}:
+        raise HTTPException(status_code=403, detail="当前节点不提供主节点管理功能")
+
+
+@router.get("/nodes", response_model=list)
+def list_nodes(admin=Depends(get_current_admin), db=Depends(get_db)):
+    _require_master()
+    return [node_response(node) for node in db.query(ComputeNodeModel).order_by(ComputeNodeModel.id).all()]
+
+
+@router.post("/nodes")
+def create_node(req: ComputeNodeRequest, admin=Depends(get_current_admin), db=Depends(get_db)):
+    _require_master()
+    node_id = req.id.strip()
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}", node_id):
+        raise HTTPException(status_code=400, detail="节点 ID 格式无效")
+    if db.query(ComputeNodeModel).filter(ComputeNodeModel.id == node_id).first():
+        raise HTTPException(status_code=400, detail="节点已存在")
+    try:
+        base_url = "" if node_id == NODE_ID else normalize_agent_base_url(req.base_url)
+        public_host = normalize_public_host(req.public_host, required=node_id != NODE_ID)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if node_id != NODE_ID and not req.agent_token:
+        raise HTTPException(status_code=400, detail="远程节点必须提供 Agent 令牌")
+    node = ComputeNodeModel(
+        id=node_id,
+        name=req.name.strip() or node_id,
+        base_url=base_url,
+        public_host=public_host,
+        agent_token=req.agent_token or "",
+        enabled=req.enabled,
+        schedulable=req.schedulable,
+    )
+    db.add(node)
+    db.commit()
+    db.refresh(node)
+    return node_response(node)
+
+
+@router.patch("/nodes/{node_id}")
+def update_node(node_id: str, req: ComputeNodeUpdate, admin=Depends(get_current_admin), db=Depends(get_db)):
+    _require_master()
+    node = db.query(ComputeNodeModel).filter(ComputeNodeModel.id == node_id).first()
+    if not node:
+        raise HTTPException(status_code=404, detail="节点不存在")
+    values = _model_values(req)
+    try:
+        if values.get("base_url") is not None:
+            values["base_url"] = "" if node.id == NODE_ID else normalize_agent_base_url(values["base_url"])
+        if values.get("public_host") is not None:
+            values["public_host"] = normalize_public_host(values["public_host"], required=node.id != NODE_ID)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    for field, value in values.items():
+        if value is None:
+            continue
+        if field == "name":
+            value = value.strip() or node.id
+        setattr(node, field, value)
+    if node.id != NODE_ID and (not node.base_url or not node.agent_token or not node.public_host):
+        raise HTTPException(status_code=400, detail="远程节点必须提供 Agent 地址、令牌和公开访问地址")
+    db.commit()
+    db.refresh(node)
+    return node_response(node)
+
+
+@router.delete("/nodes/{node_id}")
+def delete_node(node_id: str, admin=Depends(get_current_admin), db=Depends(get_db)):
+    _require_master()
+    if node_id == NODE_ID:
+        raise HTTPException(status_code=400, detail="不能删除本机节点")
+    node = db.query(ComputeNodeModel).filter(ComputeNodeModel.id == node_id).first()
+    if not node:
+        return {"message": "节点不存在"}
+    if db.query(ContainerModel).filter(ContainerModel.node_id == node_id, ContainerModel.status != "removed").count():
+        raise HTTPException(status_code=400, detail="节点仍有关联容器，不能删除")
+    db.delete(node)
+    db.commit()
+    return {"message": "节点已删除"}
+
+
+@router.post("/nodes/{node_id}/test")
+def test_node(node_id: str, admin=Depends(get_current_admin), db=Depends(get_db)):
+    _require_master()
+    node = db.query(ComputeNodeModel).filter(ComputeNodeModel.id == node_id).first()
+    if not node:
+        raise HTTPException(status_code=404, detail="节点不存在")
+    try:
+        inventory = inventory_for_node(db, node)
+    except RemoteAgentError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    return {"ok": True, "node": node_response(node), "inventory": inventory}
+
+
+@router.get("/nodes-inventory", response_model=list)
+@router.get("/nodes/inventory", response_model=list)
+def nodes_inventory(admin=Depends(get_current_admin), db=Depends(get_db)):
+    _require_master()
+    return aggregate_inventories(db)
 
 
 @router.post("/users", response_model=dict)
@@ -223,7 +346,7 @@ def force_stop(container_id: int, admin=Depends(get_current_admin), db=Depends(g
     c = db.query(ContainerModel).filter(ContainerModel.id == container_id).first()
     if not c:
         raise HTTPException(status_code=404, detail="容器不存在")
-    if c.container_id and stop_container(c.container_id):
+    if c.container_id and stop_on_node(db, c):
         c.status = "stopped"
         c.stop_reason = "admin"
         from datetime import datetime
@@ -260,12 +383,14 @@ def list_all_containers(admin=Depends(get_current_admin), db=Depends(get_db)):
             "gpu_ids": r.gpu_ids or "",
             "ssh_port": r.ssh_port,
             "extra_ports": ep,
-            "ssh_password": r.ssh_password,
             "status": r.status,
             "stop_reason": getattr(r, "stop_reason", None),
             "expires_at": r.expires_at,
             "owner_username": owner.username if owner else "",
             "created_at": r.created_at,
+            "node_id": r.node_id,
+            "node_name": r.node_name,
+            "access_host": r.access_host,
         })
     return result
 

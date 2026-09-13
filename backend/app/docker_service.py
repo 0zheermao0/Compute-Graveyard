@@ -107,7 +107,7 @@ def create_container(
     gpu_ids: List[int],
     ssh_port: int,
     mem_limit_gb: int = 8,
-) -> tuple[Optional[str], str, Dict[int, int]]:
+) -> tuple[Optional[str], Optional[str], Dict[int, int]]:
     """
     创建容器（GPU 或纯 CPU），随机 SSH 密码，常用端口随机映射。
     返回 (container_id, ssh_password, extra_ports {容器端口: 宿主机端口})
@@ -153,6 +153,11 @@ def create_container(
             ports=ports_map,
             volumes=volumes,
             environment={"SSH_PASSWORD": ssh_password, "TZ": "Asia/Shanghai"},
+            labels={
+                "compute-graveyard.managed": "true",
+                "compute-graveyard.username": username,
+                "compute-graveyard.gpu_ids": ",".join(map(str, sorted(gpu_ids))),
+            },
             mem_limit=f"{mem_limit_gb}g",
             shm_size="32g",
         )
@@ -169,6 +174,17 @@ def _has_nvidia_runtime() -> bool:
         info = client.info()
         return "nvidia" in str(info.get("Runtimes", {})).lower()
     except Exception:
+        return False
+
+
+def is_managed_container(container_id: str) -> Optional[bool]:
+    try:
+        container = get_docker_client().containers.get(container_id)
+        labels = container.attrs.get("Config", {}).get("Labels") or {}
+        return labels.get("compute-graveyard.managed") == "true"
+    except NotFound:
+        return None
+    except DockerException:
         return False
 
 
@@ -192,8 +208,42 @@ def remove_container(container_id: str) -> bool:
         c = client.containers.get(container_id)
         c.remove(force=True)
         return True
+    except NotFound:
+        return True
     except DockerException:
         return False
+
+
+def list_managed_containers() -> List[Dict[str, Any]]:
+    try:
+        client = get_docker_client()
+        rows = []
+        for container in client.containers.list(all=True, filters={"label": "compute-graveyard.managed=true"}):
+            ports = container.attrs.get("NetworkSettings", {}).get("Ports") or {}
+            labels = container.attrs.get("Config", {}).get("Labels") or {}
+            extra_ports = {}
+            ssh_port = 0
+            for port, bindings in ports.items():
+                if not bindings:
+                    continue
+                host_port = int(bindings[0]["HostPort"])
+                container_port = int(port.split("/", 1)[0])
+                if container_port == 22:
+                    ssh_port = host_port
+                else:
+                    extra_ports[str(container_port)] = host_port
+            rows.append({
+                "container_id": container.id,
+                "name": container.name,
+                "status": container.status,
+                "username": labels.get("compute-graveyard.username", ""),
+                "gpu_ids": labels.get("compute-graveyard.gpu_ids", ""),
+                "ssh_port": ssh_port,
+                "extra_ports": extra_ports,
+            })
+        return rows
+    except DockerException as e:
+        raise RuntimeError(f"读取容器列表失败: {e}") from e
 
 
 def _parse_mib(s: str) -> Optional[int]:

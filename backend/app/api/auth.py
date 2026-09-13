@@ -1,15 +1,18 @@
 """认证 API"""
 import re
+import secrets
+
 from fastapi import APIRouter, Depends, HTTPException, Body
-from fastapi.security import OAuth2PasswordRequestForm
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer, OAuth2PasswordRequestForm
 
 from app.database import get_db
 from app.database_models import UserModel
 from app.models import UserResponse, Token, UserRegister, UserProfileUpdate, UserPasswordChange
 from app.auth import verify_password, create_access_token, get_current_user, get_password_hash
-from app.config import DEFAULT_DISK_QUOTA_BYTES
+from app.config import DEFAULT_DISK_QUOTA_BYTES, INITIAL_ADMIN_PASSWORD, INITIAL_ADMIN_USERNAME, INIT_ADMIN_TOKEN
 
 router = APIRouter()
+bootstrap_security = HTTPBearer(auto_error=False)
 
 # 用户名：名字全拼，小写字母，可含连字符，2-30 位
 USERNAME_PINYIN_RE = re.compile(r"^[a-z][a-z0-9\-]{1,29}$")
@@ -45,7 +48,6 @@ def login(form: OAuth2PasswordRequestForm = Depends(), db=Depends(get_db)):
 
 @router.post("/login/json", response_model=Token)
 def login_json(body: dict = Body(...), db=Depends(get_db)):
-    """JSON 登录，便于调试：{"username":"admin","password":"admin123"}"""
     username = body.get("username")
     password = body.get("password")
     if not username or not password:
@@ -54,33 +56,29 @@ def login_json(body: dict = Body(...), db=Depends(get_db)):
 
 
 @router.post("/init-admin")
-def init_admin(db=Depends(get_db)):
-    """
-    强制初始化/重置 admin 账号（admin/admin123）。
-    仅在无用户或 admin 密码错误时生效，用于恢复。
-    """
-    from app.database_models import UserModel
-    from app.auth import get_password_hash, verify_password
-    admin = db.query(UserModel).filter(UserModel.username == "admin").first()
-    correct_hash = get_password_hash("admin123")
-    if not admin:
-        admin = UserModel(
-            username="admin",
-            hashed_password=correct_hash,
-            role="admin",
-            display_name="管理员",
-            approved=1,
-            disk_quota_bytes=DEFAULT_DISK_QUOTA_BYTES,
-        )
-        db.add(admin)
-        db.commit()
-        return {"message": "已创建 admin 账号"}
-    if not verify_password("admin123", admin.hashed_password):
-        admin.hashed_password = correct_hash
-        admin.approved = 1
-        db.commit()
-        return {"message": "已重置 admin 密码"}
-    return {"message": "admin 已存在且密码正确"}
+def init_admin(
+    credentials: HTTPAuthorizationCredentials = Depends(bootstrap_security),
+    db=Depends(get_db),
+):
+    if not INIT_ADMIN_TOKEN or not credentials or credentials.scheme.lower() != "bearer":
+        raise HTTPException(status_code=404, detail="Not Found")
+    if not secrets.compare_digest(credentials.credentials, INIT_ADMIN_TOKEN):
+        raise HTTPException(status_code=401, detail="无效的初始化凭据")
+    if not INITIAL_ADMIN_PASSWORD:
+        raise HTTPException(status_code=503, detail="未配置初始管理员密码")
+    if db.query(UserModel).count() != 0:
+        raise HTTPException(status_code=409, detail="系统已初始化")
+    admin = UserModel(
+        username=INITIAL_ADMIN_USERNAME,
+        hashed_password=get_password_hash(INITIAL_ADMIN_PASSWORD),
+        role="admin",
+        display_name="管理员",
+        approved=1,
+        disk_quota_bytes=DEFAULT_DISK_QUOTA_BYTES,
+    )
+    db.add(admin)
+    db.commit()
+    return {"message": "已创建初始管理员"}
 
 
 @router.post("/register")

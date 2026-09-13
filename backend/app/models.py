@@ -1,7 +1,7 @@
 """Pydantic 请求/响应模型"""
 from datetime import datetime
-from typing import List, Optional
-from pydantic import BaseModel, Field
+from typing import List, Literal, Optional
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 class UserBase(BaseModel):
@@ -37,6 +37,8 @@ class UserPasswordChange(BaseModel):
 
 
 class UserResponse(UserBase):
+    model_config = ConfigDict(from_attributes=True)
+
     id: int
     role: str
     real_name: Optional[str] = None
@@ -45,8 +47,6 @@ class UserResponse(UserBase):
     approved: Optional[bool] = None
     created_at: datetime
 
-    class Config:
-        from_attributes = True
 
 
 class Token(BaseModel):
@@ -118,6 +118,21 @@ class GPUSharingStatus(BaseModel):
     selectable: bool  # 是否仍可选择（未满员）
 
 
+class DashboardNode(BaseModel):
+    node_id: str
+    node_name: str
+    online: bool
+    schedulable: bool
+    public_host: Optional[str] = None
+    is_local: bool = False
+    gpus: List[GPUInfo] = Field(default_factory=list)
+    system_load: Optional[SystemLoad] = None
+    container_count: int = 0
+    occupancies: List[ContainerOccupancy] = Field(default_factory=list)
+    gpu_sharing: List[GPUSharingStatus] = Field(default_factory=list)
+    error: Optional[str] = None
+
+
 class DashboardResponse(BaseModel):
     gpus: List[GPUInfo]
     system_load: SystemLoad
@@ -127,12 +142,26 @@ class DashboardResponse(BaseModel):
     monthly_ranking: List[UsageRankItem]
     gpu_sharing: List[GPUSharingStatus] = Field(default_factory=list)
     max_gpu_sharing_users: int = 4  # 与 gpu_sharing 中 max_sharing 一致，便于前端单独展示
+    nodes: List[DashboardNode] = Field(default_factory=list)
 
 
 class ContainerApplyRequest(BaseModel):
     cpu_only: bool = False  # True 为纯 CPU 容器
     gpu_ids: Optional[List[int]] = None  # GPU 时选中的 ID，如 [0,1]
     lease_days: int = 3
+    placement_mode: Literal["local", "specific", "auto"] = "local"
+    node_id: Optional[str] = None
+
+    @field_validator("gpu_ids")
+    @classmethod
+    def validate_gpu_ids(cls, value):
+        if value is None:
+            return value
+        if any(not isinstance(gpu_id, int) or isinstance(gpu_id, bool) or gpu_id < 0 for gpu_id in value):
+            raise ValueError("GPU ID 必须是非负整数")
+        if len(value) != len(set(value)):
+            raise ValueError("GPU ID 不能重复")
+        return value
 
 
 class ShareApproverInfo(BaseModel):
@@ -155,6 +184,13 @@ class ContainerResponse(BaseModel):
     owner_username: str
     created_at: datetime
     stop_reason: Optional[str] = None
+    node_id: Optional[str] = None
+    node_name: Optional[str] = None
+    access_host: Optional[str] = None
+    service_scheme: Optional[str] = None
+    ssh_host: Optional[str] = None
+    ssh_url: Optional[str] = None
+    service_urls: Optional[dict] = None
     # 以下为 GPU 共用审批（仅 pending_share_approval 时有意义）
     share_approvers: Optional[List[ShareApproverInfo]] = None
     pending_lease_days: Optional[int] = None

@@ -63,6 +63,12 @@ interface Container {
   created_at: string;
   share_approvers?: { user_id: number; username: string; approved: boolean; approved_at?: string | null }[] | null;
   pending_lease_days?: number | null;
+  node_id?: string | null;
+  node_name?: string | null;
+  access_host?: string | null;
+  ssh_host?: string | null;
+  ssh_url?: string | null;
+  service_urls?: Record<string, string> | null;
 }
 
 async function copyAndFeedback(text: string, button: HTMLButtonElement) {
@@ -188,9 +194,10 @@ export default function MyContainers() {
             <thead>
               <tr>
                 <th>容器名</th>
+                <th>节点</th>
                 <th>状态</th>
                 <th>类型</th>
-                <th>SSH 端口</th>
+                <th>SSH 地址</th>
                 <th>服务端口</th>
                 <th>到期时间</th>
                 <th>SSH 密码</th>
@@ -201,6 +208,7 @@ export default function MyContainers() {
               {containers.map((c) => (
                 <tr key={c.id} className={`status-${c.status}`}>
                   <td className="col-name">{c.name}</td>
+                  <td>{c.node_name || c.node_id || "本机"}</td>
                   <td>
                     <span className={`status-badge ${c.status} ${c.stop_reason === "disk_quota" ? "quota-stopped" : ""}`}>
                       {statusText(c)}
@@ -210,13 +218,15 @@ export default function MyContainers() {
                     )}
                   </td>
                   <td>{c.gpu_ids ? `GPU ${c.gpu_ids}` : "纯 CPU"}</td>
-                  <td className="col-mono">{c.ssh_port}</td>
+                  <td className="col-mono">{c.ssh_host || c.access_host ? `${c.ssh_host || c.access_host}:${c.ssh_port}` : "-"}</td>
                   <td className="col-ports">
-                    {c.extra_ports && Object.keys(c.extra_ports).length > 0
-                      ? Object.entries(c.extra_ports).map(([cp, hp]) => (
-                        <span key={cp} className="port-item">{PORT_LABELS[cp] || cp}:{hp}</span>
+                    {c.service_urls && Object.keys(c.service_urls).length > 0
+                      ? Object.entries(c.service_urls).map(([port, url]) => (
+                        <a key={port} className="port-item" href={url} target="_blank" rel="noreferrer">{PORT_LABELS[port] || port}</a>
                       ))
-                      : "-"}
+                      : c.extra_ports && Object.keys(c.extra_ports).length > 0
+                        ? Object.entries(c.extra_ports).map(([port, hostPort]) => <span key={port} className="port-item">{PORT_LABELS[port] || port}:{hostPort}</span>)
+                        : "-"}
                   </td>
                   <td className="col-mono col-date">{new Date(c.expires_at).toLocaleString()}</td>
                   <td>
@@ -248,7 +258,7 @@ export default function MyContainers() {
                         )}
                       </div>
                     )}
-                    {c.status === "running" && c.extra_ports?.["8080"] && (
+                    {c.status === "running" && (c.service_urls?.["8080"] || ((c.access_host || c.ssh_host) && c.extra_ports?.["8080"])) && (
                       <button
                         type="button"
                         className="btn btn-frosted btn-sm"
@@ -257,18 +267,19 @@ export default function MyContainers() {
                             await copyAndFeedback(c.ssh_password, e.currentTarget);
                             pushToast(`密码 "${c.ssh_password}" 已复制，请在 VS Code 登录时使用`, "info");
                           }
-                          const url = `${window.location.protocol}//${window.location.hostname}:${c.extra_ports!["8080"]}`;
-                          window.open(url, "_blank");
+                          const host = c.access_host || c.ssh_host;
+                          const url = c.service_urls?.["8080"] || (host && c.extra_ports?.["8080"] ? `http://${host}:${c.extra_ports["8080"]}` : null);
+                          if (url) window.open(url, "_blank");
                         }}
                       >
                         打开 Code
                       </button>
                     )}
-                    {c.status === "running" && (
+                    {c.status === "running" && (c.ssh_host || c.access_host) && (
                       <button
                         type="button"
                         className="btn btn-frosted btn-sm"
-                        onClick={(e) => copyAndFeedback(`ssh -p ${c.ssh_port} root@${window.location.hostname}`, e.currentTarget)}
+                        onClick={(e) => copyAndFeedback(`ssh -p ${c.ssh_port} root@${c.ssh_host || c.access_host}`, e.currentTarget)}
                       >
                         复制 SSH
                       </button>

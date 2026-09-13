@@ -3,7 +3,7 @@ from datetime import datetime
 from sqlalchemy import BigInteger, Column, Integer, String, DateTime, Boolean, Text, ForeignKey, JSON, text
 from sqlalchemy.orm import relationship, synonym
 
-from app.config import DEFAULT_DISK_QUOTA_BYTES
+from app.config import DEFAULT_DISK_QUOTA_BYTES, NODE_ID
 from app.database import Base  # noqa: F401
 
 
@@ -35,6 +35,21 @@ class UserModel(Base):
     containers = relationship("ContainerModel", back_populates="owner")
 
 
+class ComputeNodeModel(Base):
+    __tablename__ = "compute_nodes"
+
+    id = Column(String(64), primary_key=True)
+    name = Column(String(128), nullable=False)
+    base_url = Column(String(512), nullable=False, default="")
+    public_host = Column(String(255), nullable=False, default="")
+    agent_token = Column(String(512), nullable=False, default="")
+    enabled = Column(Boolean, nullable=False, default=True, server_default=text("true"))
+    schedulable = Column(Boolean, nullable=False, default=True, server_default=text("true"))
+    last_seen_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=datetime.now)
+    updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
+
+
 class ContainerModel(Base):
     __tablename__ = "containers"
 
@@ -42,6 +57,10 @@ class ContainerModel(Base):
     container_id = Column(String(64), unique=True, index=True)  # Docker 容器 ID
     name = Column(String(128), nullable=False, unique=True)  # 容器名
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    node_id = Column(String(64), nullable=False, default=NODE_ID, index=True)
+    node_name = Column(String(128), nullable=True)
+    access_host = Column(String(255), nullable=True)
+    service_scheme = Column(String(8), nullable=False, default="http", server_default=text("'http'"))
     gpu_ids = Column(String(32), default="")  # 如 "0,1"，空表示纯 CPU
     ssh_port = Column(Integer, nullable=False)
     extra_ports = Column(String(256), nullable=True)  # JSON: {"8888":30123,"6006":30124,"8080":30125}
