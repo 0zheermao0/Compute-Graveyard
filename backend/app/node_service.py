@@ -140,6 +140,16 @@ def _users_per_gpu(db, node_id: str) -> dict[int, set[int]]:
     return result
 
 
+def _inventory_occupied_gpu_ids(inventory: dict) -> set[int]:
+    return {
+        int(value)
+        for row in inventory.get("containers", [])
+        if row.get("status") == "running"
+        for value in str(row.get("gpu_ids") or "").split(",")
+        if value.strip()
+    }
+
+
 def _has_capacity(gpu_ids: list[int], users_per_gpu: dict[int, set[int]], applicant_id: int | None, max_share: int | None) -> bool:
     if applicant_id is None or max_share is None:
         return True
@@ -176,6 +186,8 @@ def select_node(
             available_ids = {int(row["index"]) for row in inventory.get("gpus", [])}
             if not set(gpu_ids).issubset(available_ids):
                 raise ValueError("指定节点不包含所选 GPU")
+            if node.id != NODE_ID and set(gpu_ids) & _inventory_occupied_gpu_ids(inventory):
+                raise ValueError("指定节点的所选 GPU 已被占用，请选择其他 GPU")
             if applicant_id is not None and max_share is not None and not _has_capacity(gpu_ids, _users_per_gpu(db, node.id), applicant_id, max_share):
                 raise ValueError("所选 GPU 已达到共用人数上限")
         return node, inventory
@@ -202,15 +214,11 @@ def select_node(
             available_ids = {int(row["index"]) for row in inventory.get("gpus", [])}
             if not set(gpu_ids).issubset(available_ids):
                 continue
-            if applicant_id is None or max_share is None:
-                occupied_ids = {
-                    int(value)
-                    for row in running
-                    for value in str(row.get("gpu_ids") or "").split(",")
-                    if value.strip()
-                }
-                if set(gpu_ids) & occupied_ids:
-                    continue
+            occupied_ids = _inventory_occupied_gpu_ids(inventory)
+            if node.id != NODE_ID and set(gpu_ids) & occupied_ids:
+                continue
+            if node.id == NODE_ID and (applicant_id is None or max_share is None) and set(gpu_ids) & occupied_ids:
+                continue
             users_per_gpu = _users_per_gpu(db, node.id) if applicant_id is not None and max_share is not None else {}
             if not _has_capacity(gpu_ids, users_per_gpu, applicant_id, max_share):
                 continue

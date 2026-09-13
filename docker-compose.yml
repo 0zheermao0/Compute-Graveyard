@@ -5,18 +5,21 @@ services:
     build: .
     container_name: lab-gpu-manager
     ports:
-      - "8099:3000"   # 宿主机 3001 -> 容器 3000，避免与本地 3000 冲突
+      - "8099:3000"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - lab-gpu-data:/app/data
-      - /data1:/data1   # 用户目录 /data1/{username} -> 容器 /workspace
+      - ${USER_DATA_BASE:-/data1}:${USER_DATA_BASE:-/data1}
+      - ${PUBLIC_DATASETS_HOST_PATH:-/data/public_datasets}:${PUBLIC_DATASETS:-/data/public_datasets}:ro
     environment:
-      - DATABASE_URL=sqlite:///./data/lab_gpu.db
+      - DATA_DIR=${DATA_DIR:-/app/data}
+      - DATABASE_URL=${DATABASE_URL:-sqlite:///./data/lab_gpu.db}
       - JWT_SECRET=${JWT_SECRET:?set JWT_SECRET to a long random value}
       - INITIAL_ADMIN_USERNAME=${INITIAL_ADMIN_USERNAME:-admin}
       - INITIAL_ADMIN_PASSWORD=${INITIAL_ADMIN_PASSWORD:-}
       - INIT_ADMIN_TOKEN=${INIT_ADMIN_TOKEN:-}
       - CORS_ORIGINS=${CORS_ORIGINS:-}
+      - NOTIFY_WEBHOOK=${NOTIFY_WEBHOOK:-}
       - NODE_ROLE=${NODE_ROLE:-standalone}
       - NODE_ID=${NODE_ID:-local}
       - NODE_NAME=${NODE_NAME:-Local GPU Node}
@@ -24,28 +27,28 @@ services:
       - NODE_SERVICE_SCHEME=${NODE_SERVICE_SCHEME:-http}
       - AGENT_API_TOKEN=${AGENT_API_TOKEN:-}
       - AGENT_REQUEST_TIMEOUT_SECONDS=${AGENT_REQUEST_TIMEOUT_SECONDS:-10}
-      - USER_DATA_BASE=/data1
-      - PUBLIC_DATASETS=/data/public_datasets
-      - DOCKER_BASE_IMAGE=lab-image:latest
-      - SSH_PORT_START=20000
-      - SSH_PORT_END=21000
-      - SERVICE_PORT_START=30000
-      - SERVICE_PORT_END=40000
-      - DEFAULT_LEASE_DAYS=3
-      - MAX_LEASE_DAYS=7
-      - MAX_GPUS_PER_USER=2
-      - MAX_CONTAINERS_PER_USER=4
-      - DEFAULT_CPU_MEM_GB=8
-      - DEFAULT_GPU_MEM_GB_PER_GPU=32
-      - DEFAULT_MAX_GPU_SHARING_USERS=4
-      - DEFAULT_DISK_QUOTA_GB=100
-      - DISK_QUOTA_SCAN_INTERVAL_MINUTES=5
-      - DISK_QUOTA_GRACE_HOURS=24
-      - IDLE_GPU_RECLAIM_ENABLED=true
-      - IDLE_GPU_UTIL_THRESHOLD_PERCENT=5
-      - IDLE_GPU_MEMORY_THRESHOLD_PERCENT=5
-      - IDLE_GPU_DURATION_HOURS=24
-      - TZ=Asia/Shanghai
+      - USER_DATA_BASE=${USER_DATA_BASE:-/data1}
+      - PUBLIC_DATASETS=${PUBLIC_DATASETS:-/data/public_datasets}
+      - DOCKER_BASE_IMAGE=${DOCKER_BASE_IMAGE:-lab-image:latest}
+      - SSH_PORT_START=${SSH_PORT_START:-20000}
+      - SSH_PORT_END=${SSH_PORT_END:-21000}
+      - SERVICE_PORT_START=${SERVICE_PORT_START:-30000}
+      - SERVICE_PORT_END=${SERVICE_PORT_END:-40000}
+      - DEFAULT_LEASE_DAYS=${DEFAULT_LEASE_DAYS:-3}
+      - MAX_LEASE_DAYS=${MAX_LEASE_DAYS:-7}
+      - MAX_GPUS_PER_USER=${MAX_GPUS_PER_USER:-2}
+      - MAX_CONTAINERS_PER_USER=${MAX_CONTAINERS_PER_USER:-4}
+      - DEFAULT_CPU_MEM_GB=${DEFAULT_CPU_MEM_GB:-8}
+      - DEFAULT_GPU_MEM_GB_PER_GPU=${DEFAULT_GPU_MEM_GB_PER_GPU:-32}
+      - DEFAULT_MAX_GPU_SHARING_USERS=${DEFAULT_MAX_GPU_SHARING_USERS:-4}
+      - DEFAULT_DISK_QUOTA_GB=${DEFAULT_DISK_QUOTA_GB:-100}
+      - DISK_QUOTA_SCAN_INTERVAL_MINUTES=${DISK_QUOTA_SCAN_INTERVAL_MINUTES:-5}
+      - DISK_QUOTA_GRACE_HOURS=${DISK_QUOTA_GRACE_HOURS:-24}
+      - IDLE_GPU_RECLAIM_ENABLED=${IDLE_GPU_RECLAIM_ENABLED:-true}
+      - IDLE_GPU_UTIL_THRESHOLD_PERCENT=${IDLE_GPU_UTIL_THRESHOLD_PERCENT:-5}
+      - IDLE_GPU_MEMORY_THRESHOLD_PERCENT=${IDLE_GPU_MEMORY_THRESHOLD_PERCENT:-5}
+      - IDLE_GPU_DURATION_HOURS=${IDLE_GPU_DURATION_HOURS:-24}
+      - TZ=${TZ:-Asia/Shanghai}
     restart: unless-stopped
     # 需宿主机已安装 nvidia-container-toolkit，以便容器内执行 nvidia-smi 获取 GPU 信息
     deploy:

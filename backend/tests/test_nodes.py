@@ -130,6 +130,24 @@ def test_auto_placement_skips_offline_and_selects_available_gpu(monkeypatch):
         assert node.id == "free"
 
 
+def test_auto_placement_skips_remote_gpu_occupied_by_worker_local_container(monkeypatch):
+    engine = create_engine("sqlite:///:memory:")
+    ComputeNodeModel.__table__.create(engine)
+    with Session(engine) as db:
+        db.add(ComputeNodeModel(id="worker-1", name="Worker 1", base_url="http://worker", public_host="worker", agent_token="x"))
+        db.commit()
+        monkeypatch.setattr(
+            "app.node_service.inventory_for_node",
+            lambda _db, _node: {
+                "gpus": [{"index": 0, "memory_percent": 10}],
+                "containers": [{"status": "running", "gpu_ids": "0"}],
+                "system_load": {"memory_percent": 10, "cpu_percent": 10},
+            },
+        )
+        with pytest.raises(ValueError, match="没有在线且资源满足要求"):
+            select_node(db, "auto", None, [0], False, applicant_id=8, max_share=4)
+
+
 def test_remote_removal_routes_through_node_runtime(monkeypatch):
     container = SimpleNamespace(
         id=1,
@@ -169,11 +187,12 @@ def test_local_placement_rejects_unknown_gpu(monkeypatch):
             select_node(db, "local", None, [0], False)
 
 
-def test_auto_placement_allows_gpu_sharing_when_capacity_remains(monkeypatch):
+def test_auto_placement_allows_local_gpu_sharing_when_capacity_remains(monkeypatch):
     engine = create_engine("sqlite:///:memory:")
     ComputeNodeModel.__table__.create(engine)
     with Session(engine) as db:
-        db.add(ComputeNodeModel(id="shared", name="Shared", base_url="http://worker", public_host="worker", agent_token="x"))
+        from app.node_service import NODE_ID
+        db.add(ComputeNodeModel(id=NODE_ID, name="Local", public_host="localhost"))
         db.commit()
         monkeypatch.setattr(
             "app.node_service.inventory_for_node",
@@ -185,7 +204,7 @@ def test_auto_placement_allows_gpu_sharing_when_capacity_remains(monkeypatch):
         )
         monkeypatch.setattr("app.node_service._users_per_gpu", lambda _db, _node_id: {0: {7}})
         node, _ = select_node(db, "auto", None, [0], False, applicant_id=8, max_share=2)
-        assert node.id == "shared"
+        assert node.id == NODE_ID
 
 
 def test_agent_base_url_rejects_ssrf_prone_and_ambiguous_urls():

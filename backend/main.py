@@ -23,13 +23,12 @@ if CORS_ORIGINS:
         allow_headers=["*"],
     )
 
-if NODE_ROLE != "worker":
-    app.include_router(auth.router, prefix="/api/auth", tags=["认证"])
-    app.include_router(dashboard.router, prefix="/api/dashboard", tags=["看板"])
-    app.include_router(containers.router, prefix="/api/containers", tags=["容器"])
-    app.include_router(leases.router, prefix="/api/leases", tags=["租期"])
-    app.include_router(admin.router, prefix="/api/admin", tags=["管理员"])
-    app.include_router(workspace.router, prefix="/api/workspace", tags=["工作区"])
+app.include_router(auth.router, prefix="/api/auth", tags=["认证"])
+app.include_router(dashboard.router, prefix="/api/dashboard", tags=["看板"])
+app.include_router(containers.router, prefix="/api/containers", tags=["容器"])
+app.include_router(leases.router, prefix="/api/leases", tags=["租期"])
+app.include_router(admin.router, prefix="/api/admin", tags=["管理员"])
+app.include_router(workspace.router, prefix="/api/workspace", tags=["工作区"])
 app.include_router(agent.router, prefix="/api/agent/v1", tags=["节点 Agent"])
 
 
@@ -39,7 +38,7 @@ async def health():
 
 
 static_dir = Path(__file__).parent / "static"
-if NODE_ROLE != "worker" and static_dir.exists():
+if static_dir.exists():
     app.mount("/assets", StaticFiles(directory=str(static_dir / "assets")), name="assets")
 
     from fastapi.responses import FileResponse
@@ -55,15 +54,12 @@ if NODE_ROLE != "worker" and static_dir.exists():
 @app.on_event("startup")
 async def startup():
     init_db()
-    if NODE_ROLE != "worker":
-        create_default_admin()
-    if NODE_ROLE in {"standalone", "master"}:
-        from app.scheduler import start_scheduler
-        start_scheduler()
+    create_default_admin()
+    from app.scheduler import start_scheduler
+    start_scheduler()
 
 
 @app.on_event("shutdown")
 async def shutdown():
-    if NODE_ROLE in {"standalone", "master"}:
-        from app.scheduler import stop_scheduler
-        stop_scheduler()
+    from app.scheduler import stop_scheduler
+    stop_scheduler()

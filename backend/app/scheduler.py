@@ -6,7 +6,7 @@ from typing import Iterable, Mapping, Optional
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 
-from app.config import DISK_QUOTA_GRACE_HOURS, DISK_QUOTA_SCAN_INTERVAL_MINUTES, NOTIFY_WEBHOOK, NODE_ID, NODE_ROLE
+from app.config import DISK_QUOTA_GRACE_HOURS, DISK_QUOTA_SCAN_INTERVAL_MINUTES, NOTIFY_WEBHOOK, NODE_ID
 from app.container_lifecycle import remove_container_record
 from app.database import SessionLocal
 from app.database_models import ContainerModel, SystemSettings, UserModel
@@ -371,7 +371,7 @@ def _reclaim_idle_gpu_containers():
 
 
 def start_scheduler():
-    if NODE_ROLE == "worker" or scheduler.running:
+    if scheduler.running:
         return
     scheduler.add_job(_check_expiry_and_notify, IntervalTrigger(minutes=30), id="notify", max_instances=1, coalesce=True)
     scheduler.add_job(_stop_expired_containers, IntervalTrigger(minutes=5), id="stop", max_instances=1, coalesce=True)
