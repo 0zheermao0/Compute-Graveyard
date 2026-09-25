@@ -76,6 +76,7 @@ class ContainerModel(Base):
     removed_at = Column(DateTime, nullable=True)
     # GPU 共用审批：pending_share_json 存 JSON（lease_days、approvers 等），仅在 status=pending_share_approval 时有值
     pending_share_json = Column(Text, nullable=True)
+    target_container_id = Column(Integer, ForeignKey("containers.id"), nullable=True)
     owner = relationship("UserModel", back_populates="containers")
     lease_records = relationship("LeaseRecordModel", back_populates="container")
 

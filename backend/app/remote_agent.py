@@ -4,7 +4,7 @@ from urllib.parse import quote, urlsplit
 
 import httpx
 
-from app.config import AGENT_REQUEST_TIMEOUT_SECONDS
+from app.config import AGENT_MERGE_TIMEOUT_SECONDS, AGENT_REQUEST_TIMEOUT_SECONDS
 
 
 class RemoteAgentError(RuntimeError):
@@ -47,14 +47,14 @@ class RemoteAgentClient:
         self.token = token
         self.timeout = timeout
 
-    def _request(self, method: str, path: str, json: dict | None = None) -> Any:
+    def _request(self, method: str, path: str, json: dict | None = None, timeout: float | None = None) -> Any:
         try:
             response = httpx.request(
                 method,
                 f"{self.base_url}/api/agent/v1{path}",
                 headers={"Authorization": f"Bearer {self.token}"},
                 json=json,
-                timeout=self.timeout,
+                timeout=self.timeout if timeout is None else timeout,
                 follow_redirects=False,
             )
             response.raise_for_status()
@@ -77,6 +77,15 @@ class RemoteAgentClient:
 
     def create_container(self, payload: dict) -> dict:
         return self._request("POST", "/containers", json=payload)
+
+    def merge_container(self, container_id: str, payload: dict) -> dict:
+        return self._request("POST", f"/containers/{quote(container_id, safe='')}/merge", json=payload, timeout=AGENT_MERGE_TIMEOUT_SECONDS)
+
+    def rollback_merge(self, container_id: str, payload: dict) -> dict:
+        return self._request("POST", f"/containers/{quote(container_id, safe='')}/merge/rollback", json=payload, timeout=AGENT_MERGE_TIMEOUT_SECONDS)
+
+    def finalize_merge(self, container_id: str, payload: dict) -> dict:
+        return self._request("POST", f"/containers/{quote(container_id, safe='')}/merge/finalize", json=payload, timeout=AGENT_MERGE_TIMEOUT_SECONDS)
 
     def stop_container(self, container_id: str) -> dict:
         return self._request("POST", f"/containers/{quote(container_id, safe='')}/stop")

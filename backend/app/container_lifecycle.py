@@ -1,3 +1,4 @@
+import json
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Callable, Optional
@@ -39,6 +40,15 @@ def _remove_from_docker(container_id: str) -> RemovalResult:
         return RemovalResult(success=False, error=str(exc))
 
 
+def merge_cleanup_pending(container: ContainerModel) -> bool:
+    if container.status == "merging":
+        return True
+    try:
+        return container.status == "running" and "old_id" in json.loads(getattr(container, "pending_share_json", None) or "{}")
+    except (ValueError, TypeError):
+        return bool(container.pending_share_json)
+
+
 def remove_container_record(
     db,
     container: ContainerModel,
@@ -66,6 +76,8 @@ def remove_container_record(
         return RemovalResult(success=False, error="容器低利用计时已变化")
     if container.status == "removed" and not container.container_id:
         return RemovalResult(success=True, already_removed=True)
+    if merge_cleanup_pending(container):
+        return RemovalResult(success=False, error="GPU 合并尚未完成，禁止删除容器")
 
     if not container.container_id:
         return RemovalResult(success=False, error="数据库记录缺少 Docker 容器 ID，无法确认容器已不存在")

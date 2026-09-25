@@ -7,7 +7,7 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 
 from app.config import DISK_QUOTA_GRACE_HOURS, DISK_QUOTA_SCAN_INTERVAL_MINUTES, NOTIFY_WEBHOOK, NODE_ID
-from app.container_lifecycle import remove_container_record
+from app.container_lifecycle import merge_cleanup_pending, remove_container_record
 from app.database import SessionLocal
 from app.database_models import ContainerModel, SystemSettings, UserModel
 from app.docker_service import stop_container
@@ -121,6 +121,7 @@ def _candidate_still_reclaimable(db, container_id: int, snapshot: dict, signatur
         current_settings.idle_gpu_reclaim_enabled
         and current_signature == signature
         and container.status == "running"
+        and not merge_cleanup_pending(container)
         and container.container_id == snapshot["container_id"]
         and (getattr(container, "node_id", None) or NODE_ID) == snapshot.get("node_id", getattr(container, "node_id", None) or NODE_ID)
         and container.gpu_ids == snapshot["gpu_ids"]
@@ -145,7 +146,7 @@ def _mark_stopped_if_running(db, container_id: int, reason: str, now: datetime) 
         ContainerModel.id == container_id,
         ContainerModel.status == "running",
     ).first()
-    if not container:
+    if not container or merge_cleanup_pending(container):
         return None
     container.status = "stopped"
     container.stop_reason = reason
@@ -162,6 +163,8 @@ def _stop_disk_quota_containers(db, user: UserModel, now: datetime) -> None:
         ContainerModel.status == "running",
     ).all()
     for container in containers:
+        if merge_cleanup_pending(container):
+            continue
         if not container.container_id:
             logger.error("磁盘配额容器 %s 缺少 Docker ID，无法停止", container.name)
             continue
@@ -233,7 +236,7 @@ def _stop_expired_containers():
     try:
         now = datetime.now()
         for c in db.query(ContainerModel).filter(ContainerModel.status == "running").all():
-            if c.expires_at and c.expires_at <= now and c.container_id:
+            if not merge_cleanup_pending(c) and c.expires_at and c.expires_at <= now and c.container_id:
                 if _stop_container_runtime(db, c):
                     marked = _mark_stopped_if_running(db, c.id, "expired", now)
                     if marked:
@@ -296,6 +299,11 @@ def _reclaim_idle_gpu_containers():
 
         for container in containers:
             try:
+                if merge_cleanup_pending(container):
+                    container.gpu_idle_low_since = None
+                    container.gpu_idle_last_sample_at = None
+                    db.commit()
+                    continue
                 node_id = container.node_id or NODE_ID
                 if node_id not in inventories:
                     node = get_node(db, node_id)
@@ -370,6 +378,29 @@ def _reclaim_idle_gpu_containers():
         db.close()
 
 
+def _recover_pending_merges():
+    from app.api.containers import _share_action_lock, recover_incomplete_merges
+
+    with _share_action_lock:
+        db = None
+        try:
+            db = SessionLocal()
+            recover_incomplete_merges(db)
+        except Exception:
+            logger.exception("定时恢复 GPU 合并失败")
+            if db is not None:
+                try:
+                    db.rollback()
+                except Exception:
+                    logger.exception("GPU 合并恢复回滚数据库会话失败")
+        finally:
+            if db is not None:
+                try:
+                    db.close()
+                except Exception:
+                    logger.exception("GPU 合并恢复关闭数据库会话失败")
+
+
 def start_scheduler():
     if scheduler.running:
         return
@@ -378,6 +409,7 @@ def start_scheduler():
     scheduler.add_job(_remove_stopped_containers, IntervalTrigger(hours=1), id="remove", max_instances=1, coalesce=True)
     scheduler.add_job(_enforce_disk_quotas, IntervalTrigger(minutes=DISK_QUOTA_SCAN_INTERVAL_MINUTES), id="disk-quota", max_instances=1, coalesce=True)
     scheduler.add_job(_reclaim_idle_gpu_containers, IntervalTrigger(minutes=5), id="idle-gpu-reclaim", max_instances=1, coalesce=True)
+    scheduler.add_job(_recover_pending_merges, IntervalTrigger(minutes=5), id="recover-gpu-merges", max_instances=1, coalesce=True)
     scheduler.start()
     logger.info("定时任务已启动")
 

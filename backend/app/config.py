@@ -1,5 +1,6 @@
 """应用配置"""
 import os
+import math
 from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -56,3 +57,6 @@ AGENT_API_TOKEN = os.getenv("AGENT_API_TOKEN", "").strip()
 AGENT_REQUEST_TIMEOUT_SECONDS = float(os.getenv("AGENT_REQUEST_TIMEOUT_SECONDS", "10"))
 if AGENT_REQUEST_TIMEOUT_SECONDS <= 0:
     raise ValueError("AGENT_REQUEST_TIMEOUT_SECONDS must be positive")
+AGENT_MERGE_TIMEOUT_SECONDS = float(os.getenv("AGENT_MERGE_TIMEOUT_SECONDS", "900"))
+if not math.isfinite(AGENT_MERGE_TIMEOUT_SECONDS) or not AGENT_REQUEST_TIMEOUT_SECONDS < AGENT_MERGE_TIMEOUT_SECONDS <= 3600:
+    raise ValueError("AGENT_MERGE_TIMEOUT_SECONDS must exceed agent request timeout and be at most 3600")

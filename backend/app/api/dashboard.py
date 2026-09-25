@@ -28,7 +28,7 @@ router = APIRouter()
 def _container_duration_hours(c: ContainerModel, now: datetime) -> float:
     """计算容器已使用时长（小时）"""
     start = c.created_at
-    end = now if c.status == "running" else (c.stopped_at or now)
+    end = now if c.status in {"running", "merging"} else (c.stopped_at or now)
     if not start or not end:
         return 0.0
     delta = end - start
@@ -40,7 +40,7 @@ def _distinct_users_per_gpu(db, node_id: str = NODE_ID) -> dict:
     from collections import defaultdict
 
     m = defaultdict(set)
-    for c in db.query(ContainerModel).filter(ContainerModel.status == "running", ContainerModel.node_id == node_id).all():
+    for c in db.query(ContainerModel).filter(ContainerModel.status.in_(["running", "merging"]), ContainerModel.node_id == node_id).all():
         if not c.gpu_ids:
             continue
         for gid in map(int, c.gpu_ids.split(",")):
@@ -79,7 +79,7 @@ def get_dashboard(db=Depends(get_db), _=Depends(get_current_user)):
     occupancies = []
     occupancies_by_node = defaultdict(list)
     all_containers = []
-    containers = db.query(ContainerModel).filter(ContainerModel.status == "running").all()
+    containers = db.query(ContainerModel).filter(ContainerModel.status.in_(["running", "merging"])).all()
     for c in containers:
         owner = db.query(UserModel).filter(UserModel.id == c.user_id).first()
         if not owner:

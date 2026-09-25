@@ -51,6 +51,13 @@ def init_db():
     _migrate_disk_quota()
     _migrate_container_stop_reason()
     _migrate_compute_nodes()
+    _migrate_container_merge()
+
+
+def _migrate_container_merge(bind=None):
+    if bind is None:
+        bind = engine
+    _add_missing_columns(bind, "containers", {"target_container_id": "INTEGER REFERENCES containers(id)"})
 
 
 def _migrate_pending_share_json():

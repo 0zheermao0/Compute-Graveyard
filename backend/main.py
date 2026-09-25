@@ -55,7 +55,8 @@ if static_dir.exists():
 async def startup():
     init_db()
     create_default_admin()
-    from app.scheduler import start_scheduler
+    from app.scheduler import _recover_pending_merges, start_scheduler
+    _recover_pending_merges()
     start_scheduler()
 
 

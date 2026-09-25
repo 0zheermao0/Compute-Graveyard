@@ -1,11 +1,26 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { fetcher } from "../api/client";
 import type { DashboardNode } from "../pages/Dashboard";
 import "./ApplyModal.css";
 
 const SERVICE_LABELS: Record<string, string> = { 8888: "Jupyter", 6006: "TensorBoard", 8080: "Code Server" };
 
+const gpuIds = (value: string) => (value.match(/\d+/g) ?? []).map(Number);
+const displayExpiry = (value: string) => value.replace("T", " ").slice(0, 19);
+
 type PlacementMode = "auto" | "local" | "specific";
+type ApplyMode = "new" | "merge";
+
+interface MergeTarget {
+  id: number;
+  name: string;
+  status: string;
+  container_id: string | null;
+  node_id: string | null;
+  node_name?: string | null;
+  gpu_ids: string;
+  expires_at: string;
+}
 
 export interface GpuSharingRow {
   gpu_index: number;
@@ -57,6 +72,11 @@ interface GpuChoice {
 export default function ApplyModal({ gpuSharing, nodes, onClose, onSuccess }: ApplyModalProps) {
   const localNode = nodes.find((node) => node.is_local);
   const defaultMode: PlacementMode = nodes.length > 1 ? "auto" : localNode ? "local" : "specific";
+  const [applyMode, setApplyMode] = useState<ApplyMode>("new");
+  const [targets, setTargets] = useState<MergeTarget[]>([]);
+  const [targetsLoading, setTargetsLoading] = useState(true);
+  const [targetsError, setTargetsError] = useState("");
+  const [targetId, setTargetId] = useState<number | null>(null);
   const [cpuOnly, setCpuOnly] = useState(false);
   const [selected, setSelected] = useState<number[]>([]);
   const [leaseDays, setLeaseDays] = useState(3);
@@ -66,8 +86,46 @@ export default function ApplyModal({ gpuSharing, nodes, onClose, onSuccess }: Ap
   const [error, setError] = useState("");
   const [created, setCreated] = useState<CreatedContainer | null>(null);
   const [pendingInfo, setPendingInfo] = useState<string | null>(null);
+  const [submittedMode, setSubmittedMode] = useState<ApplyMode>("new");
+
+  useEffect(() => {
+    let active = true;
+    fetcher<MergeTarget[]>("/containers/my").then((containers) => {
+      if (active) setTargets(containers);
+    }).catch((e) => {
+      if (active) setTargetsError(e instanceof Error ? e.message : "加载已有容器失败");
+    }).finally(() => {
+      if (active) setTargetsLoading(false);
+    });
+    return () => { active = false; };
+  }, []);
+
+  const eligibleTargets = targets.filter((container) => container.status === "running" && Boolean(container.container_id));
+  const target = eligibleTargets.find((container) => container.id === targetId);
+  const targetNodeId = target?.node_id || localNode?.node_id;
+  const targetNode = nodes.find((node) => node.node_id === targetNodeId);
+  const existingGpuIds = new Set(gpuIds(target?.gpu_ids ?? ""));
+  const ownedGpuIds = new Set(targets.filter((container) => container.status === "running" && (container.node_id || localNode?.node_id) === targetNodeId).flatMap((container) => gpuIds(container.gpu_ids)));
+  const merging = applyMode === "merge";
+  const effectivePlacement = merging ? "specific" : placementMode;
+  const effectiveNodeId = merging ? targetNodeId : nodeId;
 
   const gpuChoices = useMemo<GpuChoice[]>(() => {
+    if (merging) {
+      const sharing = new Map((targetNode?.gpu_sharing ?? []).map((row) => [row.gpu_index, row]));
+      return (targetNode?.gpus ?? []).filter((gpu) => !existingGpuIds.has(gpu.index)).map((gpu) => {
+        const status = sharing.get(gpu.index);
+        const occupiedByMe = ownedGpuIds.has(gpu.index);
+        const full = Boolean(status && status.occupant_count >= status.max_sharing);
+        const selectable = Boolean(targetNode?.online && targetNode.schedulable && status && (status.selectable || (full && occupiedByMe)));
+        return {
+          index: gpu.index,
+          label: `GPU ${gpu.index} · ${gpu.name}`,
+          detail: !targetNode?.online ? "节点离线" : !targetNode.schedulable ? "节点不可调度" : !status ? "共享状态不可用" : full ? occupiedByMe ? "已满额（本人已占用，可申请合并）" : `已满额（${status.occupant_count} / ${status.max_sharing}）` : status.occupant_count === 0 ? "空闲" : `占用 ${status.occupant_count} 人 / 上限 ${status.max_sharing}`,
+          selectable,
+        };
+      });
+    }
     if (placementMode === "local") {
       const rows = localNode?.gpu_sharing?.length ? localNode.gpu_sharing : gpuSharing;
       return rows.map((row) => ({
@@ -106,7 +164,14 @@ export default function ApplyModal({ gpuSharing, nodes, onClose, onSuccess }: Ap
         selectable: selected.includes(index) || compatibleNodes.length > 0,
       };
     });
-  }, [gpuSharing, localNode, nodeId, nodes, placementMode, selected]);
+  }, [gpuSharing, localNode, nodeId, nodes, placementMode, selected, merging, targetNode, target?.gpu_ids, targetNodeId, targets]);
+
+  const setMode = (mode: ApplyMode) => {
+    setApplyMode(mode);
+    setSelected([]);
+    setCpuOnly(false);
+    setError("");
+  };
 
   const setPlacement = (mode: PlacementMode) => {
     setPlacementMode(mode);
@@ -121,12 +186,24 @@ export default function ApplyModal({ gpuSharing, nodes, onClose, onSuccess }: Ap
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (placementMode === "specific" && !nodeId) {
+    if (merging && (!target || !targetNode)) {
+      setError("请选择运行中的已有容器及其节点");
+      return;
+    }
+    if (effectivePlacement === "specific" && !effectiveNodeId) {
       setError("请选择目标节点");
       return;
     }
+    if (merging && (!targetNode?.online || !targetNode.schedulable)) {
+      setError(`节点「${targetNode?.node_name || target?.node_name || targetNodeId}」离线或不可调度，暂无法合并 GPU`);
+      return;
+    }
     if (!cpuOnly && selected.length === 0) {
-      setError("请选择至少一块 GPU，或勾选纯 CPU 容器");
+      setError(merging ? "请选择至少一块尚未分配给该容器的 GPU" : "请选择至少一块 GPU，或勾选纯 CPU 容器");
+      return;
+    }
+    if (merging && selected.some((id) => !gpuChoices.find((choice) => choice.index === id && choice.selectable))) {
+      setError("所选 GPU 已不可用，请重新选择");
       return;
     }
     setLoading(true);
@@ -135,15 +212,17 @@ export default function ApplyModal({ gpuSharing, nodes, onClose, onSuccess }: Ap
       const res = await fetcher<ApplyApiResult>("/containers/apply", {
         method: "POST",
         body: JSON.stringify({
-          cpu_only: cpuOnly,
-          gpu_ids: cpuOnly ? [] : selected,
-          lease_days: leaseDays,
-          placement_mode: placementMode,
-          node_id: placementMode === "specific" ? nodeId : null,
+          cpu_only: merging ? false : cpuOnly,
+          gpu_ids: merging ? selected : cpuOnly ? [] : selected,
+          lease_days: merging ? 1 : leaseDays,
+          placement_mode: effectivePlacement,
+          node_id: effectivePlacement === "specific" ? effectiveNodeId : null,
+          target_container_id: merging ? targetId : null,
         }),
       });
+      setSubmittedMode(applyMode);
       if (res.pending_share_approval) {
-        setPendingInfo(res.message || "已发起共用申请，占用者全部同意后自动创建容器");
+        setPendingInfo(merging ? "已发起共用申请，占用者全部同意后将新增 GPU 合并至原容器；到期时间沿用原容器，合并时运行中的进程将停止。" : res.message || "已发起共用申请，占用者全部同意后自动创建容器");
         return;
       }
       const container = res.container;
@@ -186,9 +265,9 @@ export default function ApplyModal({ gpuSharing, nodes, onClose, onSuccess }: Ap
     return (
       <div className="modal-overlay" onClick={handleDone}>
         <div className="modal modal-success" onClick={(e) => e.stopPropagation()}>
-          <div className="modal-header"><h2>申请成功</h2><button className="btn btn-ghost" onClick={handleDone}>×</button></div>
+          <div className="modal-header"><h2>{submittedMode === "merge" ? "GPU 合并成功" : "申请成功"}</h2><button className="btn btn-ghost" onClick={handleDone}>×</button></div>
           <div className="created-info">
-            <p className="created-tagline">升华还是埋没，看自己的造化。</p>
+            {submittedMode === "merge" ? <p className="modal-hint">新增 GPU 已合并至原容器，容器内文件及 /workspace 保留；原运行进程已停止，到期时间不变。</p> : <p className="created-tagline">升华还是埋没，看自己的造化。</p>}
             <p><strong>请妥善保存以下信息，关闭后可在「我的容器」中查看。</strong></p>
             {created.node_name && <div className="created-row"><span>计算节点:</span><code>{created.node_name}</code></div>}
             <div className="created-row"><span>SSH 端口:</span><code>{created.ssh_port}</code></div>
@@ -211,7 +290,7 @@ export default function ApplyModal({ gpuSharing, nodes, onClose, onSuccess }: Ap
   }
 
   const hasAnyGpu = gpuChoices.length > 0;
-  const submitDisabled = loading || (placementMode === "specific" && !nodeId) || (!cpuOnly && (!hasAnyGpu || selected.length === 0));
+  const submitDisabled = loading || (merging && (targetsLoading || !target || !targetNode?.online || !targetNode.schedulable)) || (effectivePlacement === "specific" && !effectiveNodeId) || ((merging || !cpuOnly) && (!hasAnyGpu || selected.length === 0 || selected.some((id) => !gpuChoices.find((choice) => choice.index === id && choice.selectable))));
 
   return (
     <div className="modal-overlay" onClick={onClose}>
@@ -219,14 +298,36 @@ export default function ApplyModal({ gpuSharing, nodes, onClose, onSuccess }: Ap
         <div className="modal-header"><h2>申请计算容器</h2><button className="btn btn-ghost" onClick={onClose}>×</button></div>
         <form onSubmit={handleSubmit}>
           <div className="form-group">
+            <label>申请方式</label>
+            <div className="placement-options apply-mode-options">
+              <button type="button" className={applyMode === "new" ? "active" : ""} onClick={() => setMode("new")}>新建容器</button>
+              <button type="button" className={merging ? "active" : ""} onClick={() => setMode("merge")}>合并至已有容器</button>
+            </div>
+          </div>
+          {merging && (
+            <div className="form-group">
+              <label htmlFor="merge-target">目标容器</label>
+              <select id="merge-target" className="node-select" value={targetId ?? ""} onChange={(e) => { setTargetId(e.target.value ? Number(e.target.value) : null); setSelected([]); setError(""); }} disabled={targetsLoading || !!targetsError}>
+                <option value="">{targetsLoading ? "正在加载容器…" : "请选择已有容器"}</option>
+                {eligibleTargets.map((container) => {
+                  const node = nodes.find((item) => item.node_id === (container.node_id || localNode?.node_id));
+                  return <option key={container.id} value={container.id} disabled={!node?.online || !node.schedulable}>{container.name} · {node?.node_name || container.node_name || container.node_id || "未知节点"} · {!node ? "节点不可用" : !node.online ? "离线" : !node.schedulable ? "不可调度" : `到期 ${displayExpiry(container.expires_at)}（服务器时间）`}</option>;
+                })}
+              </select>
+              {targetsError && <p className="form-error">{targetsError}</p>}
+              {!targetsLoading && !targetsError && eligibleTargets.length === 0 && <p className="modal-hint">暂无运行中且有 Docker ID 的可合并容器。</p>}
+              {target && <p className="modal-hint">目标节点：{targetNode?.node_name || target.node_name || target.node_id || "未知节点"}；沿用原容器到期时间 {displayExpiry(target.expires_at)}（服务器时间）。合并允许短暂停机，容器内文件及 /workspace 保留，运行中的进程将停止。</p>}
+            </div>
+          )}
+          {!merging && <div className="form-group">
             <label>节点调度方式</label>
             <div className="placement-options">
               <button type="button" className={placementMode === "auto" ? "active" : ""} onClick={() => setPlacement("auto")}>自动调度</button>
               <button type="button" className={placementMode === "local" ? "active" : ""} onClick={() => setPlacement("local")} disabled={!localNode?.online || !localNode.schedulable}>本机节点</button>
               <button type="button" className={placementMode === "specific" ? "active" : ""} onClick={() => setPlacement("specific")}>指定节点</button>
             </div>
-          </div>
-          {placementMode === "specific" && (
+          </div>}
+          {!merging && placementMode === "specific" && (
             <div className="form-group">
               <label>目标节点</label>
               <select className="node-select" value={nodeId} onChange={(e) => { setNodeId(e.target.value); setSelected([]); }}>
@@ -235,13 +336,13 @@ export default function ApplyModal({ gpuSharing, nodes, onClose, onSuccess }: Ap
               </select>
             </div>
           )}
-          <div className="form-group"><label className="checkbox-label"><input type="checkbox" checked={cpuOnly} onChange={(e) => setCpuOnly(e.target.checked)} />纯 CPU 容器（无 GPU）</label></div>
-          {!cpuOnly && (
+          {!merging && <div className="form-group"><label className="checkbox-label"><input type="checkbox" checked={cpuOnly} onChange={(e) => setCpuOnly(e.target.checked)} />纯 CPU 容器（无 GPU）</label></div>}
+          {(merging || !cpuOnly) && (
             <div className="form-group">
               <label>选择 GPU（可多选）</label>
-              <p className="modal-hint gpu-share-hint">自动调度会从在线且可调度的节点中选择；指定节点时仅展示该节点 GPU。</p>
+              <p className="modal-hint gpu-share-hint">{merging ? "可选择目标节点上尚未分配给该容器的 GPU；满额但本人已占用的卡也可申请。共用 GPU 需等待占用者同意；远端占用信息可能不完整，实际可用性以提交结果为准。" : "自动调度会从在线且可调度的节点中选择；指定节点时仅展示该节点 GPU。"}</p>
               <div className="gpu-checkboxes gpu-share-list">
-                {!hasAnyGpu ? <p className="no-free">当前选择下无法检测到 GPU</p> : gpuChoices.map((choice) => (
+                {!hasAnyGpu ? <p className="no-free">{merging ? target ? "目标节点没有可新增的 GPU" : "请先选择目标容器" : "当前选择下无法检测到 GPU"}</p> : gpuChoices.map((choice) => (
                   <label key={choice.index} className={`checkbox-label gpu-share-row ${choice.selectable ? "" : "gpu-share-disabled"}`}>
                     <input type="checkbox" checked={selected.includes(choice.index)} disabled={!choice.selectable} onChange={() => toggleGpu(choice)} />
                     <span className="gpu-share-label">{choice.label}<span className="gpu-share-status">{choice.detail}</span></span>
@@ -250,13 +351,13 @@ export default function ApplyModal({ gpuSharing, nodes, onClose, onSuccess }: Ap
               </div>
             </div>
           )}
-          <div className="form-group">
+          {!merging && <div className="form-group">
             <label>租期（天）</label>
             <div className="lease-days-row" role="group" aria-label="选择租期">{[1, 2, 3, 4, 5, 6, 7].map((day) => <button key={day} type="button" className={`lease-day-btn ${leaseDays === day ? "active" : ""}`} onClick={() => setLeaseDays(day)}>{day} 天</button>)}</div>
-          </div>
-          <p className="modal-hint">SSH 与常用端口随机映射，密码自动分配；个人目录挂载至 /workspace</p>
+          </div>}
+          {!merging && <p className="modal-hint">SSH 与常用端口随机映射，密码自动分配；个人目录挂载至 /workspace</p>}
           {error && <div className="form-error">{error}</div>}
-          <div className="modal-actions"><button type="button" className="btn" onClick={onClose}>取消</button><button type="submit" className="btn btn-primary" disabled={submitDisabled}>{loading ? "申请中…" : "确认申请"}</button></div>
+          <div className="modal-actions"><button type="button" className="btn" onClick={onClose}>取消</button><button type="submit" className="btn btn-primary" disabled={submitDisabled}>{loading ? "申请中…" : merging ? "确认合并 GPU" : "确认申请"}</button></div>
         </form>
       </div>
     </div>

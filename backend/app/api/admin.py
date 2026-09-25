@@ -12,7 +12,7 @@ from app.database import get_db
 from app.database_models import UserModel, ContainerModel, LeaseRecordModel, ComputeNodeModel
 from app.models import UserCreate, UserResponse
 from app.auth import get_password_hash
-from app.container_lifecycle import remove_container_record
+from app.container_lifecycle import merge_cleanup_pending, remove_container_record
 from app.settings_service import SettingsValues, load_settings, save_settings
 from app.config import DEFAULT_DISK_QUOTA_BYTES, NODE_ID, NODE_ROLE
 from app.node_service import aggregate_inventories, inventory_for_node, node_response, normalize_public_host, stop_on_node
@@ -326,6 +326,8 @@ def delete_user(user_id: int, admin=Depends(get_current_admin), db=Depends(get_d
         raise HTTPException(status_code=400, detail="不能在管理后台删除管理员账号")
 
     containers = db.query(ContainerModel).filter(ContainerModel.user_id == user_id).all()
+    if any(merge_cleanup_pending(c) for c in containers):
+        raise HTTPException(status_code=409, detail="用户容器正在合并或等待清理")
     for c in containers:
         if c.status != "removed" and c.container_id:
             result = remove_container_record(db, c, "管理员删除用户")
@@ -346,6 +348,8 @@ def force_stop(container_id: int, admin=Depends(get_current_admin), db=Depends(g
     c = db.query(ContainerModel).filter(ContainerModel.id == container_id).first()
     if not c:
         raise HTTPException(status_code=404, detail="容器不存在")
+    if merge_cleanup_pending(c):
+        raise HTTPException(status_code=409, detail="容器正在合并或等待清理")
     if c.container_id and stop_on_node(db, c):
         c.status = "stopped"
         c.stop_reason = "admin"

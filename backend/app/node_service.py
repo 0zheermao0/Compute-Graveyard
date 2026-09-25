@@ -48,7 +48,7 @@ def build_service_url(scheme: str, host: str, port: int) -> str:
 def local_inventory(db) -> dict:
     containers = db.query(ContainerModel).filter(
         ContainerModel.node_id == NODE_ID,
-        ContainerModel.status.in_(["running", "stopped"]),
+        ContainerModel.status.in_(["running", "merging", "stopped"]),
     ).all()
     database_containers = []
     for row in containers:
@@ -132,7 +132,7 @@ def aggregate_inventories(db, enabled_only: bool = True) -> list[dict]:
 
 def _users_per_gpu(db, node_id: str) -> dict[int, set[int]]:
     result: dict[int, set[int]] = {}
-    rows = db.query(ContainerModel).filter(ContainerModel.node_id == node_id, ContainerModel.status == "running").all()
+    rows = db.query(ContainerModel).filter(ContainerModel.node_id == node_id, ContainerModel.status.in_(["running", "merging"])).all()
     for row in rows:
         for value in str(row.gpu_ids or "").split(","):
             if value.strip():
@@ -144,7 +144,7 @@ def _inventory_occupied_gpu_ids(inventory: dict) -> set[int]:
     return {
         int(value)
         for row in inventory.get("containers", [])
-        if row.get("status") == "running"
+        if row.get("status") in {"running", "merging"} or str(row.get("name") or "").endswith("-merge-old")
         for value in str(row.get("gpu_ids") or "").split(",")
         if value.strip()
     }
@@ -186,8 +186,10 @@ def select_node(
             available_ids = {int(row["index"]) for row in inventory.get("gpus", [])}
             if not set(gpu_ids).issubset(available_ids):
                 raise ValueError("指定节点不包含所选 GPU")
-            if node.id != NODE_ID and set(gpu_ids) & _inventory_occupied_gpu_ids(inventory):
-                raise ValueError("指定节点的所选 GPU 已被占用，请选择其他 GPU")
+            if node.id != NODE_ID:
+                known = {row.container_id for row in db.query(ContainerModel).filter(ContainerModel.node_id == node.id, ContainerModel.status.in_(["running", "merging"])).all()}
+                if any(row.get("status") == "running" and row.get("container_id") not in known and set(gpu_ids) & {int(x) for x in str(row.get("gpu_ids") or "").split(",") if x} for row in inventory.get("containers", [])):
+                    raise ValueError("指定节点的所选 GPU 存在未知占用")
             if applicant_id is not None and max_share is not None and not _has_capacity(gpu_ids, _users_per_gpu(db, node.id), applicant_id, max_share):
                 raise ValueError("所选 GPU 已达到共用人数上限")
         return node, inventory

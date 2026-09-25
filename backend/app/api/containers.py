@@ -1,5 +1,7 @@
 """容器申请 API"""
 import json
+import hashlib
+import logging
 import uuid
 from datetime import datetime, timedelta
 from functools import wraps
@@ -31,12 +33,14 @@ from app.config import (
     NODE_PUBLIC_HOST,
 )
 from app.node_service import build_service_url, delete_provisioned_container, get_node, provision_on_node, select_node
-from app.remote_agent import RemoteAgentError
+from app.remote_agent import RemoteAgentClient, RemoteAgentError
+from app.docker_service import finalize_gpu_merge, merge_container_gpus, rollback_gpu_merge
 from app.database import get_setting
 from app.quota_service import check_user_can_provision
 
 router = APIRouter()
 _share_action_lock = RLock()
+logger = logging.getLogger(__name__)
 
 
 def _synchronized_share_action(func):
@@ -56,7 +60,7 @@ def _distinct_users_per_gpu_map(db, node_id: str = NODE_ID) -> dict[int, set[int
     from collections import defaultdict
 
     m = defaultdict(set)
-    for c in db.query(ContainerModel).filter(ContainerModel.status == "running", ContainerModel.node_id == node_id).all():
+    for c in db.query(ContainerModel).filter(ContainerModel.status.in_(["running", "merging"]), ContainerModel.node_id == node_id).all():
         if not c.gpu_ids:
             continue
         for gid in map(int, c.gpu_ids.split(",")):
@@ -81,7 +85,7 @@ def _occupiers_for_gpus(db, gpu_ids: list[int], applicant_id: int, node_id: str 
     """在所选 GPU 上有运行中容器的其他用户（需征求同意），按 user_id 排序。"""
     seen: dict[int, str] = {}
     want = set(gpu_ids)
-    for c in db.query(ContainerModel).filter(ContainerModel.status == "running", ContainerModel.node_id == node_id).all():
+    for c in db.query(ContainerModel).filter(ContainerModel.status.in_(["running", "merging"]), ContainerModel.node_id == node_id).all():
         if c.user_id == applicant_id or not c.gpu_ids:
             continue
         cg = set(int(x) for x in c.gpu_ids.split(","))
@@ -153,10 +157,129 @@ def _response_from_container(db, c: ContainerModel, owner_username: str | None =
         ssh_host=access_host,
         ssh_url=f"ssh://{access_host}:{c.ssh_port}" if c.ssh_port else None,
         service_urls=service_urls,
+        target_container_id=c.target_container_id,
     )
 
 
-def _provision_running_container(db, c: ContainerModel, lease_days: int) -> None:
+def _merge_target(db, user_id: int, target_id: int, node_id: str | None = None) -> ContainerModel:
+    target = db.query(ContainerModel).filter(ContainerModel.id == target_id).first()
+    if not target or target.user_id != user_id or target.status != "running" or not target.container_id or not target.ssh_password or target.expires_at <= datetime.now():
+        raise HTTPException(status_code=400, detail="目标容器不存在、已过期或不可合并")
+    if "old_id" in (_parse_share_payload(target.pending_share_json) or {}):
+        raise HTTPException(status_code=409, detail="目标容器尚有未完成的合并清理")
+    if node_id is not None and (target.node_id or NODE_ID) != node_id:
+        raise HTTPException(status_code=400, detail="新增 GPU 必须与目标容器位于同一节点")
+    return target
+
+
+def _merge_action(node, action: str, old_id: str, data: dict):
+    if node.id == NODE_ID:
+        if action == "merge":
+            return {"container_id": merge_container_gpus(old_id, **data)}
+        if action == "rollback":
+            return rollback_gpu_merge(old_id, data["name"], data["username"], data["old_gpu_ids"])
+        return finalize_gpu_merge(old_id, data["name"], data["replacement_id"], data["username"], data["old_gpu_ids"])
+    agent = RemoteAgentClient(node.base_url, node.agent_token)
+    if action == "merge":
+        return agent.merge_container(old_id, data)
+    if action == "rollback":
+        return agent.rollback_merge(old_id, data)
+    return agent.finalize_merge(old_id, data)
+
+
+def _close_merge_request(pending: ContainerModel) -> None:
+    pending.status = "removed"
+    pending.pending_share_json = None
+    pending.container_id = None
+    pending.stopped_at = datetime.now()
+    pending.name = f"{pending.name}-done-{pending.id}"
+
+
+def _perform_merge(db, target: ContainerModel, additional: list[int], user: UserModel, pending: ContainerModel | None = None, previous_approval: str | None = None) -> None:
+    node = get_node(db, target.node_id or NODE_ID)
+    if not node:
+        raise HTTPException(status_code=400, detail="目标节点不存在")
+    old_gpus = [int(x) for x in target.gpu_ids.split(",")] if target.gpu_ids else []
+    new_gpus = sorted(set(old_gpus) | set(additional))
+    old_id = target.container_id
+    action = {"name": target.name, "username": user.username, "old_gpu_ids": old_gpus}
+    target.status = "merging"
+    target.gpu_idle_low_since = None
+    target.gpu_idle_last_sample_at = None
+    target.gpu_ids = ",".join(map(str, new_gpus))
+    target.pending_share_json = json.dumps({"old_id": old_id, "old_gpus": old_gpus, "pending_id": pending.id if pending else None, "previous_approval": previous_approval})
+    db.commit()
+    try:
+        gpu_mem_gb = int(get_setting("gpu_mem_gb_per_gpu", str(DEFAULT_GPU_MEM_GB_PER_GPU)))
+        data = {**action, "gpu_ids": new_gpus, "ssh_port": target.ssh_port,
+                "extra_ports": json.loads(target.extra_ports) if target.extra_ports else {},
+                "ssh_password_hash": hashlib.sha256(target.ssh_password.encode()).hexdigest(), "mem_limit_gb": gpu_mem_gb * len(new_gpus)}
+        result = _merge_action(node, "merge", old_id, data)
+        replacement_id = result["container_id"]
+        target.container_id = replacement_id
+        target.gpu_ids = ",".join(map(str, new_gpus))
+        target.pending_share_json = json.dumps({"old_id": old_id, "old_gpus": old_gpus, "pending_id": pending.id if pending else None, "phase": "finalize", "replacement_id": replacement_id})
+        if pending:
+            _close_merge_request(pending)
+        db.commit()
+    except Exception as exc:
+        db.rollback()
+        try:
+            _merge_action(node, "rollback", old_id, action)
+            db.refresh(target)
+            target.status = "running"
+            target.gpu_ids = ",".join(map(str, old_gpus))
+            target.pending_share_json = None
+            if pending:
+                db.refresh(pending)
+                pending.pending_share_json = previous_approval
+            db.commit()
+        except Exception:
+            db.rollback()
+            raise HTTPException(status_code=500, detail="合并未能恢复，请联系管理员；原容器数据已保留") from exc
+        raise HTTPException(status_code=500, detail="合并失败，原容器已恢复") from exc
+    try:
+        _merge_action(node, "finalize", old_id, {**action, "replacement_id": replacement_id})
+        target.pending_share_json = None
+        target.status = "running"
+        db.commit()
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(status_code=503, detail="新容器已运行但清理尚未完成，系统将重试恢复") from exc
+
+
+def recover_incomplete_merges(db) -> None:
+    for target in db.query(ContainerModel).filter(ContainerModel.pending_share_json.isnot(None), ContainerModel.status.in_(["merging", "running"])).all():
+        payload = _parse_share_payload(target.pending_share_json)
+        if not payload or "old_id" not in payload:
+            logger.error("容器 %s 合并恢复日志无效", target.id)
+            continue
+        node = get_node(db, target.node_id or NODE_ID)
+        user = db.query(UserModel).filter(UserModel.id == target.user_id).first()
+        if not node or not user:
+            logger.error("容器 %s 合并恢复缺少节点或用户", target.id)
+            continue
+        action = {"name": target.name, "username": user.username, "old_gpu_ids": payload["old_gpus"]}
+        pending = db.query(ContainerModel).filter(ContainerModel.id == payload["pending_id"]).first() if payload.get("pending_id") else None
+        try:
+            if payload.get("phase") == "finalize" or target.status == "running":
+                _merge_action(node, "finalize", payload["old_id"], {**action, "replacement_id": payload.get("replacement_id") or target.container_id})
+                if pending and pending.status == "pending_share_approval":
+                    _close_merge_request(pending)
+            else:
+                _merge_action(node, "rollback", payload["old_id"], action)
+                target.gpu_ids = ",".join(map(str, payload["old_gpus"]))
+                if pending and pending.status == "pending_share_approval" and payload.get("previous_approval"):
+                    pending.pending_share_json = payload["previous_approval"]
+            target.status = "running"
+            target.pending_share_json = None
+            db.commit()
+        except Exception:
+            db.rollback()
+            logger.exception("容器 %s 合并恢复失败，保留待恢复状态", target.id)
+
+
+def _provision_running_container(db, c: ContainerModel, lease_days: int, previous_approval: str | None = None) -> None:
     """由待审批记录实际创建 Docker 容器并改为 running。"""
     user = db.query(UserModel).filter(UserModel.id == c.user_id).first()
     if not user:
@@ -168,10 +291,16 @@ def _provision_running_container(db, c: ContainerModel, lease_days: int) -> None
         raise HTTPException(status_code=400, detail=detail)
 
     gpu_ids = [int(x) for x in c.gpu_ids.split(",")] if c.gpu_ids else []
+    if c.target_container_id is not None:
+        target = _merge_target(db, c.user_id, c.target_container_id, c.node_id or NODE_ID)
+        if set(gpu_ids) & {int(x) for x in target.gpu_ids.split(",") if x}:
+            raise HTTPException(status_code=400, detail="目标容器已占用所申请的 GPU")
+    else:
+        target = None
 
     my_running = db.query(ContainerModel).filter(
         ContainerModel.user_id == c.user_id,
-        ContainerModel.status == "running",
+        ContainerModel.status.in_(["running", "merging"]),
     ).all()
     total_gpus = sum(len(item.gpu_ids.split(",")) for item in my_running if item.gpu_ids)
     if total_gpus + len(gpu_ids) > MAX_GPUS_PER_USER:
@@ -181,6 +310,13 @@ def _provision_running_container(db, c: ContainerModel, lease_days: int) -> None
     mx = _max_gpu_sharing(db)
     if not _capacity_ok(gpu_ids, c.user_id, mx, users_per_gpu):
         raise HTTPException(status_code=400, detail="审批完成时 GPU 已无可用共用名额，请申请人重新申请")
+    current_occupiers = {uid for uid, _ in _occupiers_for_gpus(db, gpu_ids, c.user_id, c.node_id or NODE_ID)}
+    approved = {int(a["user_id"]) for a in (_parse_share_payload(c.pending_share_json) or {}).get("approvers", []) if a.get("approved")}
+    if not current_occupiers.issubset(approved):
+        raise HTTPException(status_code=400, detail="新增 GPU 占用者尚未同意，请重新申请")
+    if target:
+        _perform_merge(db, target, gpu_ids, user, pending=c, previous_approval=previous_approval)
+        return
 
     node = get_node(db, c.node_id or NODE_ID)
     if not node:
@@ -236,21 +372,37 @@ def apply_container(req: ContainerApplyRequest, user=Depends(get_current_user), 
     if req.lease_days < 1 or req.lease_days > MAX_LEASE_DAYS:
         raise HTTPException(status_code=400, detail=f"租期须在 1~{MAX_LEASE_DAYS} 天之间")
 
+    target = None
+    if req.target_container_id is not None:
+        if req.cpu_only:
+            raise HTTPException(status_code=400, detail="合并 GPU 不能选择纯 CPU 模式")
+        target = _merge_target(db, user.id, req.target_container_id)
+        if req.placement_mode == "local" and (target.node_id or NODE_ID) != NODE_ID:
+            raise HTTPException(status_code=400, detail="新增 GPU 必须与目标容器位于同一节点")
+        if req.node_id and req.node_id != (target.node_id or NODE_ID):
+            raise HTTPException(status_code=400, detail="新增 GPU 必须与目标容器位于同一节点")
+        if db.query(ContainerModel).filter(ContainerModel.target_container_id == target.id, ContainerModel.status == "pending_share_approval").count():
+            raise HTTPException(status_code=400, detail="目标容器已有待审批的合并申请")
+
     my_count = db.query(ContainerModel).filter(
         ContainerModel.user_id == user.id,
-        ContainerModel.status.in_(["running", "pending_share_approval"]),
+        ContainerModel.status.in_(["running", "merging", "pending_share_approval"]),
+        ContainerModel.target_container_id.is_(None),
     ).count()
-    if my_count >= MAX_CONTAINERS_PER_USER:
+    if not target and my_count >= MAX_CONTAINERS_PER_USER:
         raise HTTPException(status_code=400, detail=f"每人最多同时有 {MAX_CONTAINERS_PER_USER} 个运行中或待审批的容器")
 
     gpu_ids = [] if req.cpu_only else (req.gpu_ids or [])
     if not req.cpu_only and not gpu_ids:
         raise HTTPException(status_code=400, detail="请选择 GPU 或勾选纯 CPU 容器")
 
+    if target and set(gpu_ids) & set(int(x) for x in target.gpu_ids.split(",") if x):
+        raise HTTPException(status_code=400, detail="只能选择目标容器尚未占用的 GPU")
+
     if not req.cpu_only and gpu_ids:
         my_running = db.query(ContainerModel).filter(
             ContainerModel.user_id == user.id,
-            ContainerModel.status == "running",
+            ContainerModel.status.in_(["running", "merging"]),
         ).all()
         total_gpus = sum(len(c.gpu_ids.split(",")) for c in my_running if c.gpu_ids)
         if total_gpus + len(gpu_ids) > MAX_GPUS_PER_USER:
@@ -260,8 +412,8 @@ def apply_container(req: ContainerApplyRequest, user=Depends(get_current_user), 
     try:
         node, _ = select_node(
             db,
-            req.placement_mode,
-            req.node_id,
+            "specific" if target else req.placement_mode,
+            (target.node_id or NODE_ID) if target else req.node_id,
             gpu_ids,
             req.cpu_only,
             applicant_id=user.id,
@@ -298,6 +450,7 @@ def apply_container(req: ContainerApplyRequest, user=Depends(get_current_user), 
             status="pending_share_approval",
             expires_at=far_expires,
             pending_share_json=json.dumps(payload, ensure_ascii=False),
+            target_container_id=target.id if target else None,
         )
         db.add(c)
         db.commit()
@@ -305,8 +458,13 @@ def apply_container(req: ContainerApplyRequest, user=Depends(get_current_user), 
         return ContainerApplyResult(
             container=_response_from_container(db, c, user.username),
             pending_share_approval=True,
-            message="所选 GPU 上有其他同学的容器，已向对方发起共用申请，全部同意后自动创建",
+            message="新增 GPU 共用申请已发起，全部同意后合并到原容器" if target else "所选 GPU 上有其他同学的容器，已向对方发起共用申请，全部同意后自动创建",
         )
+
+    if target:
+        _merge_target(db, user.id, target.id, node.id)
+        _perform_merge(db, target, gpu_ids, user)
+        return ContainerApplyResult(container=_response_from_container(db, target, user.username), message="GPU 已合并到原容器")
 
     expires_at = datetime.now() + timedelta(days=req.lease_days)
     prefix = "labcpu" if req.cpu_only else "labgpu"
@@ -408,8 +566,8 @@ def list_notifications(user=Depends(get_current_user), db=Depends(get_db)):
                 NotificationItem(
                     id=f"share-approval-{c.id}",
                     type="share_approval_request",
-                    title="GPU 共用申请待处理",
-                    message=f"{owner_name} 申请共用 GPU {c.gpu_ids}，请同意或拒绝。",
+                    title="GPU 合并共用申请待处理" if c.target_container_id else "GPU 共用申请待处理",
+                    message=f"{owner_name} 申请将 GPU {c.gpu_ids} 合并到现有容器，请同意或拒绝。" if c.target_container_id else f"{owner_name} 申请共用 GPU {c.gpu_ids}，请同意或拒绝。",
                     created_at=c.created_at or now,
                     container_id=c.id,
                     container_name=c.name,
@@ -467,8 +625,8 @@ def list_notifications(user=Depends(get_current_user), db=Depends(get_db)):
             NotificationItem(
                 id=f"share-waiting-{c.id}",
                 type="share_waiting_for_others",
-                title="GPU 共用申请审批中",
-                message=f"容器申请 {c.name} 正在等待审批（{approved_cnt}/{total_cnt} 已同意）。",
+                title="GPU 合并申请审批中" if c.target_container_id else "GPU 共用申请审批中",
+                message=f"GPU 合并申请正在等待审批（{approved_cnt}/{total_cnt} 已同意）。" if c.target_container_id else f"容器申请 {c.name} 正在等待审批（{approved_cnt}/{total_cnt} 已同意）。",
                 created_at=c.created_at or now,
                 container_id=c.id,
                 container_name=c.name,
@@ -508,6 +666,7 @@ def approve_share(container_id: int, user=Depends(get_current_user), db=Depends(
             detail = "暂时无法确认申请人的工作区容量，请稍后重试" if not quota.scan_complete else "申请人的工作区已超过磁盘配额，清理文件后才能创建容器"
             raise HTTPException(status_code=400, detail=detail)
 
+    previous_approval = c.pending_share_json
     me["approved"] = True
     me["approved_at"] = datetime.now().isoformat()
 
@@ -516,11 +675,19 @@ def approve_share(container_id: int, user=Depends(get_current_user), db=Depends(
     if all(bool(a.get("approved")) for a in approvers):
         lease_days = int(payload.get("lease_days", DEFAULT_LEASE_DAYS))
         try:
-            _provision_running_container(db, c, lease_days)
-        except HTTPException:
+            _provision_running_container(db, c, lease_days, previous_approval)
+        except HTTPException as exc:
             db.rollback()
+            if c.target_container_id and exc.status_code == 400:
+                db.refresh(c)
+                c.status = "share_rejected"
+                c.pending_share_json = None
+                c.stopped_at = datetime.now()
+                c.name = f"{c.name}-invalid-{c.id}"
+                db.commit()
+                raise HTTPException(status_code=409, detail="申请条件已变化，原申请已取消，请重新申请") from exc
             raise
-        return {"message": "已全部同意，容器已创建"}
+        return {"message": "已全部同意，GPU 已合并" if c.target_container_id else "已全部同意，容器已创建"}
 
     db.commit()
     return {"message": "已记录您的同意"}
@@ -572,6 +739,9 @@ def delete_container(container_id: int, user=Depends(get_current_user), db=Depen
 
     if c.user_id != user.id and user.role != "admin":
         raise HTTPException(status_code=403, detail="无权操作此容器")
+
+    if c.status == "merging" or (c.status == "running" and c.pending_share_json and "old_id" in (_parse_share_payload(c.pending_share_json) or {})):
+        raise HTTPException(status_code=409, detail="容器正在合并或等待清理，请稍后重试")
 
     if c.status == "pending_share_approval":
         c.status = "removed"

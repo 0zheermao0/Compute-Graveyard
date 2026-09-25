@@ -6,6 +6,7 @@ import os
 import secrets
 import subprocess
 import json
+import hashlib
 from pathlib import Path
 from typing import List, Optional, Dict, Any
 
@@ -167,6 +168,162 @@ def create_container(
         raise RuntimeError(f"创建容器失败: {e}") from e
 
 
+def _merge_names(name: str) -> tuple[str, str]:
+    return f"{name[:85]}-merge-old", f"{name[:85]}-merge-new"
+
+
+def _merge_identity(container, name: str, username: str, old_gpu_ids: list[int]) -> None:
+    container.reload()
+    labels = container.attrs.get("Config", {}).get("Labels") or {}
+    if (container.name != name and container.name != _merge_names(name)[0]) or labels.get("compute-graveyard.managed") != "true" or labels.get("compute-graveyard.username") != username or labels.get("compute-graveyard.gpu_ids") != ",".join(map(str, sorted(old_gpu_ids))):
+        raise RuntimeError("目标容器身份不匹配")
+
+
+def rollback_gpu_merge(container_id: str, name: str, username: str, old_gpu_ids: list[int]) -> None:
+    client = get_docker_client()
+    backup_name, new_name = _merge_names(name)
+    old = client.containers.get(container_id)
+    _merge_identity(old, name, username, old_gpu_ids)
+    try:
+        replacement = client.containers.get(new_name)
+    except NotFound:
+        replacement = None
+    started = False
+    was_running = False
+    if replacement:
+        replacement.reload()
+        labels = replacement.attrs.get("Config", {}).get("Labels") or {}
+        if labels.get("compute-graveyard.merge_source") != container_id:
+            raise RuntimeError("替代容器身份不匹配，无法回滚")
+        started = replacement.status != "created"
+        was_running = replacement.status == "running"
+        if was_running:
+            replacement.stop()
+            replacement.reload()
+            if replacement.status == "running":
+                raise RuntimeError("替代容器未能停止，保留两份容器以避免数据丢失")
+    try:
+        old.reload()
+        if old.name == backup_name:
+            old.rename(name)
+        if old.status != "running":
+            old.start()
+        old.reload()
+        if old.status != "running":
+            raise RuntimeError("原容器恢复运行失败")
+    except Exception as exc:
+        if replacement and was_running:
+            try:
+                replacement.reload()
+                if replacement.status != "running":
+                    replacement.start()
+                    replacement.reload()
+                if replacement.status != "running":
+                    raise RuntimeError("替代容器未能恢复运行")
+            except Exception as recovery_error:
+                raise RuntimeError("原容器与替代容器均未能恢复运行，两份文件层均已保留") from recovery_error
+        raise RuntimeError("原容器未能恢复运行，替代容器文件层已保留") from exc
+    if replacement and started:
+        raise RuntimeError("替代容器可能有新增文件，已保留其文件层等待人工核对")
+    if replacement:
+        replacement.remove()
+
+
+def merge_container_gpus(container_id: str, name: str, username: str, old_gpu_ids: list[int], gpu_ids: list[int], ssh_port: int, extra_ports: dict, ssh_password_hash: str, mem_limit_gb: int) -> str:
+    client = get_docker_client()
+    old = client.containers.get(container_id)
+    _merge_identity(old, name, username, old_gpu_ids)
+    if old.status != "running" or not ssh_password_hash or not set(old_gpu_ids).issubset(gpu_ids) or len(gpu_ids) <= len(old_gpu_ids):
+        raise RuntimeError("目标容器状态或 GPU 参数已变化")
+    config = old.attrs.get("Config") or {}
+    host = old.attrs.get("HostConfig") or {}
+    mounts = old.attrs.get("Mounts") or []
+    workspace = os.path.join(USER_DATA_BASE, username)
+    if not any(m.get("Destination") == "/workspace" and m.get("Source") == workspace and m.get("RW") for m in mounts):
+        raise RuntimeError("目标工作区挂载不匹配")
+    if any(m.get("Destination") not in {"/workspace", "/datasets"} or m.get("Type") != "bind" for m in mounts):
+        raise RuntimeError("目标容器包含不受支持的挂载")
+    if any(m.get("Destination") == "/datasets" and (m.get("Source") != str(PUBLIC_DATASETS) or m.get("RW")) for m in mounts):
+        raise RuntimeError("公共数据集挂载不符合只读配置")
+    unsupported = ("CapAdd", "CapDrop", "Devices", "SecurityOpt", "Tmpfs", "ExtraHosts", "Dns", "DnsSearch", "DnsOptions", "Ulimits", "GroupAdd", "Sysctls", "Links", "VolumesFrom", "Mounts", "NanoCpus", "CpuQuota", "CpuPeriod", "CpuShares", "CpusetCpus", "ReadonlyRootfs", "AutoRemove", "PublishAllPorts", "OomKillDisable", "CgroupParent", "MemoryReservation", "OomScoreAdj", "Init")
+    if host.get("NetworkMode") not in {"default", "bridge"} or host.get("Privileged") or any(host.get(key) for key in unsupported) or host.get("Runtime") not in {None, "", "runc"} or host.get("PidMode") or host.get("IpcMode") not in {None, "private", ""} or host.get("RestartPolicy", {}).get("Name") not in {None, "", "no"}:
+        raise RuntimeError("目标容器包含不受支持的运行设置")
+    bindings = host.get("PortBindings") or {}
+    expected = {"22/tcp": int(ssh_port), **{f"{int(k)}/tcp": int(v) for k, v in extra_ports.items()}}
+    actual = {key: int(value[0]["HostPort"]) for key, value in bindings.items() if value}
+    if actual != expected:
+        raise RuntimeError("目标容器端口与数据库不一致")
+    env = config.get("Env") or []
+    if not any(hashlib.sha256(value.split("=", 1)[1].encode()).hexdigest() == ssh_password_hash for value in env if value.startswith("SSH_PASSWORD=")):
+        raise RuntimeError("目标容器凭据与数据库不一致")
+    backup_name, new_name = _merge_names(name)
+    try:
+        client.containers.get(new_name)
+        raise RuntimeError("已有未完成的 GPU 合并，请先恢复")
+    except NotFound:
+        pass
+    image = None
+    try:
+        old.stop()
+        image = old.commit(repository="compute-graveyard-merge", tag=container_id[:32], changes="ENV SSH_PASSWORD=")
+        image_env = (image.attrs.get("Config") or {}).get("Env") or []
+        if "SSH_PASSWORD=" not in image_env or any(value.startswith("SSH_PASSWORD=") and value != "SSH_PASSWORD=" for value in image_env):
+            raise RuntimeError("临时镜像包含明文凭据")
+        old.rename(backup_name)
+        volumes = {m["Source"]: {"bind": m["Destination"], "mode": "rw" if m["RW"] else "ro"} for m in mounts}
+        labels = dict(config.get("Labels") or {})
+        labels["compute-graveyard.gpu_ids"] = ",".join(map(str, sorted(gpu_ids)))
+        labels["compute-graveyard.merge_source"] = container_id
+        replacement = client.containers.create(
+            image.id, name=new_name, detach=True,
+            device_requests=[docker.types.DeviceRequest(driver="nvidia", device_ids=[str(i) for i in sorted(gpu_ids)], capabilities=[["gpu"]])],
+            ports=expected, volumes=volumes, environment=env, labels=labels,
+            mem_limit=max(int(host.get("Memory") or 0), mem_limit_gb * 1024 ** 3),
+            memswap_limit=max(int(host.get("MemorySwap") or 0), mem_limit_gb * 2 * 1024 ** 3) if int(host.get("MemorySwap") or 0) != -1 else -1,
+            shm_size=int(host.get("ShmSize") or 0) or "32g",
+            working_dir=config.get("WorkingDir") or None, user=config.get("User") or None,
+            command=config.get("Cmd") or None, entrypoint=config.get("Entrypoint") or None,
+        )
+        replacement.start()
+        replacement.reload()
+        if replacement.status != "running":
+            raise RuntimeError("替代容器未运行")
+        return replacement.id
+    except Exception as exc:
+        try:
+            rollback_gpu_merge(container_id, name, username, old_gpu_ids)
+        except Exception as recovery_error:
+            raise RuntimeError("GPU 合并失败且原容器未能自动恢复，请联系管理员处理") from recovery_error
+        if image:
+            try:
+                client.images.remove(image.id)
+            except DockerException:
+                pass
+        raise RuntimeError("GPU 合并失败，原容器已恢复") from exc
+
+
+def finalize_gpu_merge(container_id: str, name: str, replacement_id: str, username: str, old_gpu_ids: list[int]) -> None:
+    client = get_docker_client()
+    try:
+        old = client.containers.get(container_id)
+    except NotFound:
+        old = None
+    if old:
+        _merge_identity(old, name, username, old_gpu_ids)
+    replacement = client.containers.get(replacement_id)
+    replacement.reload()
+    if replacement.name not in {_merge_names(name)[1], name} or replacement.status != "running" or (replacement.attrs.get("Config", {}).get("Labels") or {}).get("compute-graveyard.merge_source") != container_id:
+        raise RuntimeError("替代容器身份或状态不匹配")
+    if old:
+        old.remove()
+    if replacement.name != name:
+        replacement.rename(name)
+    try:
+        client.images.remove(f"compute-graveyard-merge:{container_id[:32]}")
+    except DockerException:
+        pass
+
+
 def _has_nvidia_runtime() -> bool:
     """检测是否有 nvidia runtime"""
     try:
@@ -235,7 +392,7 @@ def list_managed_containers() -> List[Dict[str, Any]]:
             rows.append({
                 "container_id": container.id,
                 "name": container.name,
-                "status": container.status,
+                "status": "merging" if container.name.endswith("-merge-old") else container.status,
                 "username": labels.get("compute-graveyard.username", ""),
                 "gpu_ids": labels.get("compute-graveyard.gpu_ids", ""),
                 "ssh_port": ssh_port,
