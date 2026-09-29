@@ -1,6 +1,7 @@
 from datetime import datetime, timedelta
 from types import SimpleNamespace
 
+import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from sqlalchemy import Column, Integer, MetaData, String, Table, create_engine, inspect, text
@@ -11,7 +12,7 @@ from app.api import containers as containers_api
 from app.auth import create_access_token
 from app.container_lifecycle import RemovalResult, remove_container_record
 from app.database import Base, get_db
-from app.database_models import ContainerModel, UserModel, UserNotificationModel
+from app.database_models import ComputeNodeModel, ContainerModel, UserModel, UserNotificationModel
 
 from app import quota_service
 from app.database import _migrate_container_stop_reason, _migrate_disk_quota
@@ -102,6 +103,211 @@ def test_missing_storage_root_is_incomplete(monkeypatch, tmp_path):
 
     assert result.usage_bytes == 0
     assert not result.complete
+
+
+def test_worker_master_workspace_scan_is_read_only_and_isolated(monkeypatch, tmp_path):
+    monkeypatch.setattr(quota_service, "USER_DATA_BASE", tmp_path)
+    (tmp_path / "alice").mkdir()
+    (tmp_path / "alice" / "local.bin").write_bytes(b"local")
+    assert quota_service.worker_master_workspace_usage_result("alice") == quota_service.WorkspaceUsage(0, True, False)
+    assert not (tmp_path / ".compute-graveyard-master").exists()
+
+    namespace = tmp_path / ".compute-graveyard-master"
+    namespace.mkdir(mode=0o700)
+    (namespace / ".namespace").touch(mode=0o600)
+    (namespace / "alice").mkdir()
+    (namespace / "alice" / "remote.bin").write_bytes(b"remote")
+    assert quota_service.worker_master_workspace_usage_result("alice") == quota_service.WorkspaceUsage(6, True)
+    assert quota_service.worker_master_workspace_usage_result("bob") == quota_service.WorkspaceUsage(0, True)
+    (namespace / "alice" / "link").symlink_to(tmp_path / "alice")
+    assert quota_service.worker_master_workspace_usage_result("alice") == quota_service.WorkspaceUsage(6, True)
+    (namespace / ".namespace").unlink()
+    assert not quota_service.worker_master_workspace_usage_result("alice").complete
+    (namespace / ".namespace").symlink_to(tmp_path / "alice" / "local.bin")
+    assert not quota_service.worker_master_workspace_usage_result("alice").complete
+    monkeypatch.setattr(quota_service, "USER_DATA_BASE", tmp_path / "missing")
+    assert not quota_service.worker_master_workspace_usage_result("alice").complete
+
+
+def test_worker_workspace_data_reports_retained_entries_and_unsafe_namespace(monkeypatch, tmp_path):
+    monkeypatch.setattr(quota_service, "USER_DATA_BASE", tmp_path)
+    assert quota_service.worker_master_workspace_data_result() == (False, True)
+    namespace = tmp_path / ".compute-graveyard-master"
+    namespace.mkdir(mode=0o700)
+    (namespace / ".namespace").touch(mode=0o600)
+    assert quota_service.worker_master_workspace_data_result() == (False, True)
+    (namespace / "alice").mkdir()
+    assert quota_service.worker_master_workspace_data_result() == (True, True)
+    (namespace / "alice").rmdir()
+    (namespace / "link").symlink_to(tmp_path)
+    assert quota_service.worker_master_workspace_data_result() == (True, True)
+    (namespace / "link").unlink()
+    (namespace / ".namespace").unlink()
+    assert quota_service.worker_master_workspace_data_result() == (True, False)
+    (namespace / ".namespace").symlink_to(tmp_path)
+    assert quota_service.worker_master_workspace_data_result() == (True, False)
+    monkeypatch.setattr(quota_service, "USER_DATA_BASE", tmp_path / "missing")
+    assert quota_service.worker_master_workspace_data_result() == (True, False)
+
+
+def test_agent_workspace_usage_requires_worker_token_and_valid_username(monkeypatch, tmp_path):
+    from app.api import agent
+
+    monkeypatch.setattr(quota_service, "USER_DATA_BASE", tmp_path)
+    monkeypatch.setattr(agent, "NODE_ROLE", "worker")
+    monkeypatch.setattr(agent, "AGENT_API_TOKEN", "test-token")
+    app = FastAPI()
+    app.include_router(agent.router, prefix="/api/agent/v1")
+    with TestClient(app) as client:
+        path = "/api/agent/v1/workspace-usage/alice"
+        assert client.get(path).status_code == 401
+        assert client.get(path, headers={"Authorization": "Bearer wrong"}).status_code == 401
+        headers = {"Authorization": "Bearer test-token"}
+        response = client.get(path, headers=headers)
+        assert response.status_code == 200
+        assert response.json() == {"node_id": agent.NODE_ID, "username": "alice", "usage_bytes": 0, "complete": True, "namespace_present": False}
+        assert client.get("/api/agent/v1/workspace-usage/ALICE", headers=headers).status_code == 422
+        data_path = "/api/agent/v1/workspace-data"
+        assert client.get(data_path).status_code == 401
+        assert client.get(data_path, headers={"Authorization": "Bearer wrong"}).status_code == 401
+        assert client.get(data_path, headers=headers).json() == {
+            "node_id": agent.NODE_ID, "has_workspace_data": False, "complete": True,
+        }
+        monkeypatch.setattr(agent, "NODE_ROLE", "master")
+        assert client.get(path, headers=headers).status_code == 404
+        assert client.get(data_path, headers=headers).status_code == 404
+
+
+def test_master_aggregates_all_workers_and_preserves_state_on_failure(monkeypatch, tmp_path):
+    from app.remote_agent import RemoteAgentError
+
+    monkeypatch.setattr(quota_service, "USER_DATA_BASE", tmp_path)
+    monkeypatch.setattr(quota_service, "NODE_ROLE", "master")
+    (tmp_path / "alice").mkdir()
+    (tmp_path / "alice" / "local.bin").write_bytes(b"1234")
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    with Session(engine) as db:
+        user = UserModel(username="alice", hashed_password="x", role="user", disk_quota_bytes=10)
+        db.add(user)
+        db.add_all([
+            ComputeNodeModel(id="worker-a", name="a", base_url="http://worker-a.example", agent_token="token", enabled=False),
+            ComputeNodeModel(id="worker-b", name="b", base_url="http://worker-b.example", agent_token="token", schedulable=False),
+        ])
+        db.commit()
+        calls = []
+
+        def usage(client, username):
+            calls.append((client.base_url, username))
+            return {"node_id": "worker-a" if "worker-a" in client.base_url else "worker-b",
+                    "username": username, "usage_bytes": 3, "complete": True, "namespace_present": True}
+
+        monkeypatch.setattr(quota_service.RemoteAgentClient, "workspace_usage", usage)
+        now = datetime(2026, 1, 1)
+        status = quota_service.refresh_user_quota(db, user, now=now)
+        assert status.usage_bytes == 10 and status.over_quota
+        assert len(calls) == 2
+        assert user.disk_quota_exceeded_since == now
+        checked_at = user.disk_usage_checked_at
+
+        for change in (
+            {"node_id": "wrong"}, {"username": "bob"}, {"usage_bytes": True},
+            {"usage_bytes": -1}, {"complete": 1}, {"complete": False},
+            {"namespace_present": 1}, {"namespace_present": None},
+        ):
+            def malformed(client, username):
+                return {**usage(client, username), **change} if "worker-a" in client.base_url else usage(client, username)
+            monkeypatch.setattr(quota_service.RemoteAgentClient, "workspace_usage", malformed)
+            incomplete = quota_service.refresh_user_quota(db, user, now=now + timedelta(hours=25))
+            assert not incomplete.scan_complete and incomplete.blocked
+            assert user.disk_usage_bytes == 10
+            assert user.disk_quota_exceeded_since == now
+            assert user.disk_usage_checked_at == checked_at
+        monkeypatch.setattr(quota_service.RemoteAgentClient, "workspace_usage", lambda *_: None)
+        assert not quota_service.refresh_user_quota(db, user).scan_complete
+        def unavailable(*_):
+            raise RemoteAgentError("offline")
+        monkeypatch.setattr(quota_service.RemoteAgentClient, "workspace_usage", unavailable)
+        assert not quota_service.refresh_user_quota(db, user).scan_complete
+        quota_service.refresh_user_quota(db, user, usage_bytes=0)
+        assert user.disk_usage_bytes == 0 and user.disk_usage_scan_complete
+    engine.dispose()
+
+
+def test_missing_worker_namespace_requires_no_prior_user_container(monkeypatch, tmp_path):
+    monkeypatch.setattr(quota_service, "NODE_ROLE", "master")
+    monkeypatch.setattr(quota_service, "USER_DATA_BASE", tmp_path)
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    with Session(engine) as db:
+        user = UserModel(username="alice", hashed_password="x", role="user", disk_quota_bytes=100)
+        node = ComputeNodeModel(id="remote", name="remote", base_url="http://remote.example", agent_token="token")
+        db.add_all([user, node])
+        db.commit()
+        monkeypatch.setattr(quota_service.RemoteAgentClient, "workspace_usage", lambda _client, name: {
+            "node_id": "remote", "username": name, "usage_bytes": 0, "complete": True,
+            "namespace_present": False,
+        })
+        assert quota_service.refresh_user_quota(db, user).scan_complete
+        db.add(ContainerModel(name="old-box", user_id=user.id, node_id=node.id, ssh_port=22001,
+                              status="removed", expires_at=datetime.now() + timedelta(days=1)))
+        db.commit()
+        assert not quota_service.refresh_user_quota(db, user).scan_complete
+        assert not quota_service.check_user_can_provision(db, user).allowed
+        db.query(ContainerModel).delete()
+        db.commit()
+        assert quota_service.refresh_user_quota(db, user).scan_complete
+    engine.dispose()
+
+
+def test_master_remote_usage_stops_remote_container_after_grace(monkeypatch, tmp_path):
+    from app import scheduler
+
+    monkeypatch.setattr(quota_service, "NODE_ROLE", "master")
+    monkeypatch.setattr(quota_service, "USER_DATA_BASE", tmp_path)
+    monkeypatch.setattr(scheduler, "NODE_ROLE", "master")
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    with Session(engine) as db:
+        user = UserModel(username="alice", hashed_password="x", role="user", disk_quota_bytes=10)
+        node = ComputeNodeModel(id="remote", name="remote", base_url="http://remote.example", agent_token="token")
+        db.add_all([user, node])
+        db.flush()
+        container = ContainerModel(name="remote-box", user_id=user.id, node_id=node.id,
+                                   container_id="docker-remote", ssh_port=20001, status="running",
+                                   expires_at=datetime.now() + timedelta(days=2))
+        db.add(container)
+        db.commit()
+        user_id, container_id = user.id, container.id
+        monkeypatch.setattr(quota_service.RemoteAgentClient, "workspace_usage", lambda _client, name: {
+            "node_id": "remote", "username": name, "usage_bytes": 11, "complete": True, "namespace_present": True,
+        })
+        stopped = []
+        monkeypatch.setattr(scheduler, "stop_on_node", lambda _db, row: stopped.append(row.container_id) or True)
+        monkeypatch.setattr(scheduler, "_send_notify", lambda *_: None)
+        monkeypatch.setattr(scheduler, "SessionLocal", lambda: Session(engine))
+        scheduler._enforce_disk_quotas()
+        assert stopped == []
+        with Session(engine) as check:
+            owner = check.get(UserModel, user_id)
+            owner.disk_quota_exceeded_since = datetime.now() - timedelta(hours=25)
+            check.commit()
+        scheduler._enforce_disk_quotas()
+        assert stopped == ["docker-remote"]
+        with Session(engine) as check:
+            row = check.get(ContainerModel, container_id)
+            assert row.status == "stopped" and row.stop_reason == "disk_quota"
+    engine.dispose()
+
+
+def test_worker_local_quota_never_queries_master_workspaces(monkeypatch, tmp_path):
+    monkeypatch.setattr(quota_service, "NODE_ROLE", "worker")
+    monkeypatch.setattr(quota_service, "USER_DATA_BASE", tmp_path)
+    (tmp_path / "alice").mkdir()
+    (tmp_path / "alice" / "local.bin").write_bytes(b"123")
+    monkeypatch.setattr(quota_service.RemoteAgentClient, "workspace_usage", lambda *_: pytest.fail("remote scan"))
+    user = SimpleNamespace(username="alice", role="user", disk_quota_bytes=10, disk_usage_bytes=0)
+    assert quota_service.refresh_user_quota(FakeDb(), user).usage_bytes == 3
 
 
 def test_refresh_user_quota_blocks_and_clears(monkeypatch):

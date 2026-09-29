@@ -10,13 +10,59 @@ from sqlalchemy import Column, Integer, MetaData, String, Table, create_engine, 
 from sqlalchemy.orm import Session
 from sqlalchemy.pool import StaticPool
 
-from app.api import agent, containers, dashboard
+from app.api import admin, agent, containers, dashboard
 from app.auth import create_access_token
 from app.container_lifecycle import remove_container_record
 from app.database import Base, _migrate_compute_nodes, get_db
 from app.database_models import ComputeNodeModel, ContainerModel, ShareRequestModel, UserModel
 from app.node_service import aggregate_inventories, build_service_url, node_response, select_node, verified_owners
 from app.remote_agent import normalize_agent_base_url
+
+
+def test_admin_delete_node_requires_verified_empty_master_workspace(monkeypatch):
+    from app.remote_agent import RemoteAgentError
+
+    monkeypatch.setattr(admin, "NODE_ROLE", "master")
+    engine = create_engine("sqlite:///:memory:", connect_args={"check_same_thread": False}, poolclass=StaticPool)
+    Base.metadata.create_all(engine)
+    with Session(engine) as db:
+        db.add(UserModel(username="boss", hashed_password="x", role="admin"))
+        db.add(UserModel(username="alice", hashed_password="x", role="user"))
+        db.add(ComputeNodeModel(id="remote", name="remote", base_url="http://remote.example", agent_token="token"))
+        db.commit()
+        alice = db.query(UserModel).filter_by(username="alice").one()
+        db.add(ContainerModel(name="old-box", user_id=alice.id, node_id="remote", status="removed",
+                              ssh_port=22001, expires_at=datetime.now() + timedelta(days=1)))
+        db.commit()
+        app = FastAPI()
+        app.include_router(admin.router, prefix="/api/admin")
+        app.dependency_overrides[get_db] = lambda: db
+        path = "/api/admin/nodes/remote"
+        headers = {"Authorization": f"Bearer {create_access_token({'sub': 'boss'})}"}
+        response = {"node_id": "remote", "has_workspace_data": True, "complete": True}
+        monkeypatch.setattr(admin.RemoteAgentClient, "workspace_data", lambda _: response.copy())
+        with TestClient(app) as client:
+            assert client.delete(path).status_code == 401
+            assert client.delete(path, headers=headers).status_code == 409
+            for change in ({"node_id": "wrong"}, {"complete": False}, {"complete": 1},
+                           {"has_workspace_data": 0}, {"has_workspace_data": None}):
+                monkeypatch.setattr(admin.RemoteAgentClient, "workspace_data", lambda _, change=change: {
+                    **response, **change,
+                })
+                assert client.delete(path, headers=headers).status_code == 502
+            monkeypatch.setattr(admin.RemoteAgentClient, "workspace_data", lambda _: None)
+            assert client.delete(path, headers=headers).status_code == 502
+            def offline(_):
+                raise RemoteAgentError("offline")
+            monkeypatch.setattr(admin.RemoteAgentClient, "workspace_data", offline)
+            assert client.delete(path, headers=headers).status_code == 502
+            assert db.get(ComputeNodeModel, "remote") is not None
+            monkeypatch.setattr(admin.RemoteAgentClient, "workspace_data", lambda _: {
+                **response, "has_workspace_data": False,
+            })
+            assert client.delete(path, headers=headers).status_code == 200
+            assert db.get(ComputeNodeModel, "remote") is None
+    engine.dispose()
 
 
 def test_node_response_never_exposes_agent_token():

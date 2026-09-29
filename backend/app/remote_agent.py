@@ -72,6 +72,12 @@ class RemoteAgentClient:
     def inventory(self) -> dict:
         return self._request("GET", "/inventory")
 
+    def workspace_usage(self, username: str) -> dict:
+        return self._request("GET", f"/workspace-usage/{quote(username, safe='')}")
+
+    def workspace_data(self) -> dict:
+        return self._request("GET", "/workspace-data")
+
     def owners_for_worker(self, node_id: str) -> dict:
         return self._request("GET", f"/owners/{quote(node_id, safe='')}")
 

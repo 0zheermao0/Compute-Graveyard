@@ -13,6 +13,7 @@ from app.worker_share import create_request, expire_request, master_workspace, r
 from app.node_service import active_owners
 from app.docker_service import allocate_service_ports, allocate_ssh_port, create_container, finalize_gpu_merge, get_docker_client, is_managed_container, list_managed_containers, merge_container_gpus, remove_container, rollback_gpu_merge, stop_container
 from app.node_service import local_inventory
+from app.quota_service import worker_master_workspace_data_result, worker_master_workspace_usage_result
 
 router = APIRouter()
 security = HTTPBearer(auto_error=False)
@@ -338,6 +339,21 @@ def owners_for_worker(node_id: str, credentials: HTTPAuthorizationCredentials = 
 @router.get("/health", dependencies=[Depends(require_agent_token)])
 def health():
     return {"status": "ok", "node_id": NODE_ID, "node_name": NODE_NAME, "role": NODE_ROLE}
+
+
+@router.get("/workspace-usage/{username}", dependencies=[Depends(require_agent_token)])
+def workspace_usage(username: str):
+    if not _USERNAME_RE.fullmatch(username):
+        raise HTTPException(status_code=422, detail="用户名格式无效")
+    result = worker_master_workspace_usage_result(username)
+    return {"node_id": NODE_ID, "username": username, "usage_bytes": result.usage_bytes, "complete": result.complete,
+            "namespace_present": result.namespace_present}
+
+
+@router.get("/workspace-data", dependencies=[Depends(require_agent_token)])
+def workspace_data():
+    has_workspace_data, complete = worker_master_workspace_data_result()
+    return {"node_id": NODE_ID, "has_workspace_data": has_workspace_data, "complete": complete}
 
 
 @router.get("/inventory", dependencies=[Depends(require_agent_token)])

@@ -8,9 +8,10 @@ from threading import RLock
 from typing import Optional
 from uuid import uuid4
 
-from app.database_models import UserNotificationModel
+from app.database_models import ComputeNodeModel, ContainerModel, UserModel, UserNotificationModel
 
-from app.config import DEFAULT_DISK_QUOTA_BYTES, DISK_QUOTA_GRACE_HOURS, USER_DATA_BASE
+from app.config import DEFAULT_DISK_QUOTA_BYTES, DISK_QUOTA_GRACE_HOURS, NODE_ID, NODE_ROLE, USER_DATA_BASE
+from app.remote_agent import RemoteAgentClient, RemoteAgentError
 
 
 DISK_QUOTA_GRACE_PERIOD = timedelta(hours=DISK_QUOTA_GRACE_HOURS)
@@ -21,6 +22,7 @@ _QUOTA_LOCKS: defaultdict[str, RLock] = defaultdict(RLock)
 class WorkspaceUsage:
     usage_bytes: int
     complete: bool
+    namespace_present: bool = True
 
 
 @dataclass(frozen=True)
@@ -120,6 +122,78 @@ def workspace_usage_for_user(username: str) -> int:
     return workspace_usage_for_user_result(username).usage_bytes
 
 
+def _master_namespace() -> tuple[Optional[Path], bool]:
+    base = Path(USER_DATA_BASE)
+    try:
+        if not stat.S_ISDIR(base.lstat().st_mode):
+            return None, False
+        namespace = base / ".compute-graveyard-master"
+        try:
+            namespace_stat = namespace.lstat()
+        except FileNotFoundError:
+            return None, True
+        if (not stat.S_ISDIR(namespace_stat.st_mode) or namespace_stat.st_uid != os.geteuid()
+                or namespace_stat.st_mode & 0o077):
+            return None, False
+        marker_stat = (namespace / ".namespace").lstat()
+        if not stat.S_ISREG(marker_stat.st_mode) or marker_stat.st_uid != os.geteuid():
+            return None, False
+        return namespace, True
+    except (FileNotFoundError, PermissionError, OSError):
+        return None, False
+
+
+def worker_master_workspace_data_result() -> tuple[bool, bool]:
+    namespace, safe = _master_namespace()
+    if not safe:
+        return True, False
+    if namespace is None:
+        return False, True
+    try:
+        with os.scandir(namespace) as entries:
+            return any(entry.name != ".namespace" for entry in entries), True
+    except (PermissionError, OSError):
+        return True, False
+
+
+def worker_master_workspace_usage_result(username: str) -> WorkspaceUsage:
+    if _workspace_path_for_user(username) is None:
+        return WorkspaceUsage(0, False)
+    namespace, safe = _master_namespace()
+    if not safe:
+        return WorkspaceUsage(0, False)
+    if namespace is None:
+        return WorkspaceUsage(0, True, namespace_present=False)
+    return calculate_workspace_usage_result(namespace / username)
+
+
+def aggregate_workspace_usage_result(db, username: str) -> WorkspaceUsage:
+    local = workspace_usage_for_user_result(username)
+    if NODE_ROLE != "master":
+        return local
+    total = local.usage_bytes
+    complete = local.complete
+    for node in db.query(ComputeNodeModel).filter(ComputeNodeModel.id != NODE_ID).all():
+        try:
+            payload = RemoteAgentClient(node.base_url, node.agent_token).workspace_usage(username)
+            if (not isinstance(payload, dict) or payload.get("node_id") != node.id
+                    or payload.get("username") != username or type(payload.get("usage_bytes")) is not int
+                    or payload["usage_bytes"] < 0 or type(payload.get("complete")) is not bool
+                    or type(payload.get("namespace_present")) is not bool
+                    or not payload["namespace_present"] and payload["usage_bytes"] != 0):
+                complete = False
+                continue
+            total += payload["usage_bytes"]
+            complete = complete and payload["complete"]
+            if not payload["namespace_present"] and db.query(ContainerModel).join(
+                    UserModel, ContainerModel.user_id == UserModel.id).filter(
+                    ContainerModel.node_id == node.id, UserModel.username == username).first():
+                complete = False
+        except (RemoteAgentError, ValueError, TypeError):
+            complete = False
+    return WorkspaceUsage(total, complete)
+
+
 def _quota_value(user) -> int:
     for name in ("disk_quota_bytes", "quota_bytes"):
         value = getattr(user, name, None)
@@ -205,7 +279,7 @@ def _refresh_user_quota(
         measurement = (
             WorkspaceUsage(max(0, int(usage_bytes)), True)
             if usage_bytes is not None
-            else workspace_usage_for_user_result(user.username)
+            else aggregate_workspace_usage_result(db, user.username)
         )
         if not measurement.complete:
             stored_usage = _usage_value(user)

@@ -16,7 +16,7 @@ from app.container_lifecycle import merge_cleanup_pending, remove_container_reco
 from app.settings_service import SettingsValues, load_settings, save_settings
 from app.config import DEFAULT_DISK_QUOTA_BYTES, NODE_ID, NODE_ROLE
 from app.node_service import aggregate_inventories, inventory_for_node, node_response, normalize_public_host, stop_on_node
-from app.remote_agent import RemoteAgentError, normalize_agent_base_url
+from app.remote_agent import RemoteAgentClient, RemoteAgentError, normalize_agent_base_url
 from app.quota_service import quota_status, quota_status_payload, refresh_user_quota
 
 router = APIRouter()
@@ -119,6 +119,16 @@ def delete_node(node_id: str, admin=Depends(get_current_admin), db=Depends(get_d
         return {"message": "节点不存在"}
     if db.query(ContainerModel).filter(ContainerModel.node_id == node_id, ContainerModel.status != "removed").count():
         raise HTTPException(status_code=400, detail="节点仍有关联容器，不能删除")
+    try:
+        payload = RemoteAgentClient(node.base_url, node.agent_token).workspace_data()
+    except RemoteAgentError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    if (not isinstance(payload, dict) or payload.get("node_id") != node_id
+            or type(payload.get("has_workspace_data")) is not bool or type(payload.get("complete")) is not bool
+            or not payload["complete"]):
+        raise HTTPException(status_code=502, detail="无法确认节点 Master 工作区数据状态")
+    if payload["has_workspace_data"]:
+        raise HTTPException(status_code=409, detail="节点仍保留 Master 工作区数据，不能删除")
     db.delete(node)
     db.commit()
     return {"message": "节点已删除"}
