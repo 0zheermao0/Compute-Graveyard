@@ -114,6 +114,55 @@
   padding: 0.6rem;
 }
 
+.profile-token-section {
+  max-width: 640px;
+}
+
+.profile-token-section .profile-form {
+  max-width: none;
+}
+
+.profile-token-section h3 {
+  margin: 1.25rem 0 0.75rem;
+  font-size: 0.9rem;
+}
+
+.profile-token-created {
+  margin-top: 1.25rem;
+  overflow-wrap: anywhere;
+}
+
+.profile-token-created label {
+  display: block;
+  margin: 0.75rem 0 0.35rem;
+  font-size: 0.85rem;
+}
+
+.profile-agent-instructions {
+  min-height: 220px;
+  resize: vertical;
+  font-family: monospace;
+}
+
+.profile-token-created .profile-submit {
+  margin-top: 0.75rem;
+}
+
+.profile-token-list {
+  padding: 0;
+  margin: 0;
+  list-style: none;
+}
+
+.profile-token-list li {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 0.75rem;
+  padding: 0.75rem 0;
+  border-top: 1px solid rgba(255, 255, 255, 0.08);
+}
+
 @media (max-width: 768px) {
   .profile-container {
     gap: 1rem;

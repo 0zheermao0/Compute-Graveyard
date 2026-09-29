@@ -35,6 +35,20 @@ class UserModel(Base):
     over_quota_since = synonym("disk_quota_exceeded_since")
     quota_blocked = synonym("disk_quota_blocked")
     containers = relationship("ContainerModel", back_populates="owner")
+    personal_tokens = relationship("PersonalTokenModel", back_populates="owner", cascade="all, delete-orphan")
+
+
+class PersonalTokenModel(Base):
+    __tablename__ = "personal_tokens"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    name = Column(String(64), nullable=False)
+    token_hash = Column(String(64), unique=True, nullable=False, index=True)
+    created_at = Column(DateTime, nullable=False, default=datetime.now)
+    expires_at = Column(DateTime, nullable=False)
+    revoked_at = Column(DateTime, nullable=True)
+    owner = relationship("UserModel", back_populates="personal_tokens")
 
 
 class UserNotificationModel(Base):
