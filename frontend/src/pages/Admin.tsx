@@ -208,6 +208,7 @@ export default function Admin() {
   const [users, setUsers] = useState<User[]>([]);
   const [pendingUsers, setPendingUsers] = useState<PendingUser[]>([]);
   const [containers, setContainers] = useState<Container[]>([]);
+  const [showRemovedContainers, setShowRemovedContainers] = useState(false);
   const [newUser, setNewUser] = useState({ username: "", password: "", display_name: "" });
   const [loading, setLoading] = useState(false);
   const [createError, setCreateError] = useState("");
@@ -266,7 +267,7 @@ export default function Admin() {
 
   const loadContainers = async () => {
     const data = await fetcher<Container[]>("/admin/containers");
-    setContainers(data);
+    setContainers(data.sort((a, b) => new Date(b.expires_at).getTime() - new Date(a.expires_at).getTime()));
   };
 
   const loadNodes = async () => {
@@ -945,6 +946,10 @@ export default function Admin() {
       {/* 所有容器 */}
       <section className="admin-section">
         <h2>全部容器</h2>
+        <label className="node-check">
+          <input type="checkbox" checked={showRemovedContainers} onChange={(e) => setShowRemovedContainers(e.target.checked)} />
+          显示已清理容器
+        </label>
         <div className="admin-table-wrap"><table className="admin-table">
           <thead>
             <tr>
@@ -960,7 +965,7 @@ export default function Admin() {
             </tr>
           </thead>
           <tbody>
-            {containers.map((c) => (
+            {containers.filter((c) => showRemovedContainers || c.status !== "removed").map((c) => (
               <tr key={c.id}>
                 <td>{c.name}</td>
                 <td>{c.node_name || c.node_id || "本机"}</td>
