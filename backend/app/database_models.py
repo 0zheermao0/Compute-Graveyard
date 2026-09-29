@@ -1,9 +1,9 @@
 """SQLAlchemy 数据库模型"""
 from datetime import datetime
-from sqlalchemy import BigInteger, Column, Integer, String, DateTime, Boolean, Text, ForeignKey, JSON, text
+from sqlalchemy import BigInteger, Column, Integer, String, DateTime, Boolean, Text, ForeignKey, UniqueConstraint, text
 from sqlalchemy.orm import relationship, synonym
 
-from app.config import DEFAULT_DISK_QUOTA_BYTES, NODE_ID
+from app.config import DEFAULT_DISK_QUOTA_BYTES, MAX_GPUS_PER_USER, NODE_ID
 from app.database import Base  # noqa: F401
 
 
@@ -20,12 +20,14 @@ class UserModel(Base):
     approved = Column(Integer, default=0)  # 0 待审批 1 已通过，admin 默认 1
     role = Column(String(16), default="user")  # user | admin
     created_at = Column(DateTime, default=datetime.now)
+    max_gpus_per_user = Column(Integer, nullable=False, default=MAX_GPUS_PER_USER, server_default=text(str(MAX_GPUS_PER_USER)))
     disk_quota_bytes = Column(BigInteger, nullable=False, default=DEFAULT_DISK_QUOTA_BYTES, server_default=text(str(DEFAULT_DISK_QUOTA_BYTES)))
     disk_usage_bytes = Column(BigInteger, nullable=False, default=0, server_default=text("0"))
     disk_usage_checked_at = Column(DateTime, nullable=True)
     disk_usage_scan_complete = Column(Boolean, nullable=False, default=False, server_default=text("false"))
     disk_quota_exceeded_since = Column(DateTime, nullable=True)
     disk_quota_blocked = Column(Boolean, nullable=False, default=False, server_default=text("false"))
+    disk_notification_band = Column(Integer, nullable=False, default=0, server_default=text("0"))
     quota_bytes = synonym("disk_quota_bytes")
     usage_bytes = synonym("disk_usage_bytes")
     quota_exceeded_since = synonym("disk_quota_exceeded_since")
@@ -33,6 +35,22 @@ class UserModel(Base):
     over_quota_since = synonym("disk_quota_exceeded_since")
     quota_blocked = synonym("disk_quota_blocked")
     containers = relationship("ContainerModel", back_populates="owner")
+
+
+class UserNotificationModel(Base):
+    __tablename__ = "user_notifications"
+    __table_args__ = (UniqueConstraint("user_id", "event_key"),)
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    event_key = Column(String(128), nullable=False)
+    type = Column(String(64), nullable=False)
+    title = Column(String(256), nullable=False)
+    message = Column(Text, nullable=False)
+    container_id = Column(Integer, nullable=True)
+    container_name = Column(String(128), nullable=True)
+    created_at = Column(DateTime, nullable=False, default=datetime.now)
+    read_at = Column(DateTime, nullable=True)
 
 
 class ComputeNodeModel(Base):
@@ -79,6 +97,18 @@ class ContainerModel(Base):
     target_container_id = Column(Integer, ForeignKey("containers.id"), nullable=True)
     owner = relationship("UserModel", back_populates="containers")
     lease_records = relationship("LeaseRecordModel", back_populates="container")
+
+
+class ShareRequestModel(Base):
+    __tablename__ = "share_requests"
+
+    id = Column(String(64), primary_key=True)
+    payload = Column(Text, nullable=False)
+    approvers = Column(Text, nullable=False)
+    state = Column(String(24), nullable=False)
+    expires_at = Column(DateTime, nullable=False)
+    created_at = Column(DateTime, default=datetime.now, nullable=False)
+    provision_result = Column(Text, nullable=True)
 
 
 class LeaseRecordModel(Base):

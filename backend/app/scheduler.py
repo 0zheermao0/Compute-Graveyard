@@ -1,4 +1,5 @@
 """定时任务：到期通知、自动回收"""
+from contextlib import nullcontext
 from datetime import datetime, timedelta
 import logging
 from typing import Iterable, Mapping, Optional
@@ -6,15 +7,16 @@ from typing import Iterable, Mapping, Optional
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 
-from app.config import DISK_QUOTA_GRACE_HOURS, DISK_QUOTA_SCAN_INTERVAL_MINUTES, NOTIFY_WEBHOOK, NODE_ID
+from app.config import DISK_QUOTA_GRACE_HOURS, DISK_QUOTA_SCAN_INTERVAL_MINUTES, NOTIFY_WEBHOOK, NODE_ID, NODE_ROLE
 from app.container_lifecycle import merge_cleanup_pending, remove_container_record
 from app.database import SessionLocal
-from app.database_models import ContainerModel, SystemSettings, UserModel
+from app.database_models import ContainerModel, SystemSettings, UserModel, UserNotificationModel
 from app.docker_service import stop_container
 from app.node_service import get_node, inventory_for_node, stop_on_node
 from app.remote_agent import RemoteAgentError
 from app.quota_service import refresh_user_quota
 from app.settings_service import idle_policy_signature, load_settings
+from app.worker_share import worker_gpu_lock
 
 logger = logging.getLogger(__name__)
 scheduler = BackgroundScheduler()
@@ -135,9 +137,16 @@ def _candidate_still_reclaimable(db, container_id: int, snapshot: dict, signatur
     return container, current_settings
 
 
+def _worker_lifecycle_lock(container):
+    if NODE_ROLE == "worker" and (not getattr(container, "node_id", None) or container.node_id == NODE_ID):
+        return worker_gpu_lock
+    return nullcontext()
+
+
 def _stop_container_runtime(db, container: ContainerModel) -> bool:
     if not getattr(container, "node_id", None) or container.node_id == NODE_ID:
-        return stop_container(container.container_id)
+        with _worker_lifecycle_lock(container):
+            return stop_container(container.container_id)
     return stop_on_node(db, container)
 
 
@@ -153,6 +162,13 @@ def _mark_stopped_if_running(db, container_id: int, reason: str, now: datetime) 
     container.stopped_at = now
     container.gpu_idle_low_since = None
     container.gpu_idle_last_sample_at = None
+    if reason == "disk_quota":
+        db.add(UserNotificationModel(
+            user_id=container.user_id, event_key=f"disk_quota_stopped-{container.id}",
+            type="disk_quota_stopped", title="容器因磁盘配额被停止",
+            message=f"容器 {container.name} 因工作区持续超额已停止。",
+            container_id=container.id, container_name=container.name, created_at=now,
+        ))
     db.commit()
     return container
 
@@ -255,7 +271,9 @@ def _remove_stopped_containers():
         for container in containers:
             if not container.stopped_at or container.stopped_at > threshold:
                 continue
-            result = remove_container_record(db, container, "停止 24 小时后自动清理")
+            with _worker_lifecycle_lock(container):
+                options = {"notification_type": "disk_quota_destroyed"} if getattr(container, "stop_reason", None) == "disk_quota" else {}
+                result = remove_container_record(db, container, "停止 24 小时后自动清理", **options)
             if result.success:
                 logger.info("已清理容器 %s", container.name)
             else:
@@ -355,16 +373,18 @@ def _reclaim_idle_gpu_containers():
                     f"{current_settings.idle_gpu_memory_threshold_percent}%，连续 {current_settings.idle_gpu_duration_hours} 小时"
                 )
                 original_name = current.name
-                result = remove_container_record(
-                    db,
-                    current,
-                    reason,
-                    now=now,
-                    expected_status="running",
-                    expected_container_id=snapshot["container_id"],
-                    expected_gpu_ids=snapshot["gpu_ids"],
-                    expected_low_since=snapshot["low_since"],
-                )
+                with _worker_lifecycle_lock(current):
+                    result = remove_container_record(
+                        db,
+                        current,
+                        reason,
+                        now=now,
+                        expected_status="running",
+                        expected_container_id=snapshot["container_id"],
+                        expected_gpu_ids=snapshot["gpu_ids"],
+                        expected_low_since=snapshot["low_since"],
+                        notification_type="gpu_idle_reclaimed",
+                    )
                 if result.success:
                     _send_notify(f"【Lab-GPU】容器 {original_name} 因 {reason}，已立即停止并销毁，宿主机 workspace 已保留。")
                 else:
@@ -401,6 +421,34 @@ def _recover_pending_merges():
                     logger.exception("GPU 合并恢复关闭数据库会话失败")
 
 
+def _reconcile_pending_remote_shares():
+    if NODE_ROLE != "master":
+        return
+    from app.api.containers import _reconcile_remote_shares, _share_action_lock
+
+    with _share_action_lock:
+        db = None
+        try:
+            db = SessionLocal()
+            user_ids = [user_id for (user_id,) in db.query(ContainerModel.user_id).filter(
+                ContainerModel.status.in_(["pending_share_approval", "provisioning", "share_uncertain"]),
+                ContainerModel.pending_share_json.like('%"request_id"%'),
+            ).distinct().all()]
+            for user_id in user_ids:
+                try:
+                    _reconcile_remote_shares(db, user_id)
+                except Exception:
+                    db.rollback()
+                    logger.warning("Worker 共用申请用户 %s 暂不可调和", user_id)
+        except Exception:
+            if db is not None:
+                db.rollback()
+            logger.warning("Worker 共用申请定时扫描失败")
+        finally:
+            if db is not None:
+                db.close()
+
+
 def start_scheduler():
     if scheduler.running:
         return
@@ -410,6 +458,8 @@ def start_scheduler():
     scheduler.add_job(_enforce_disk_quotas, IntervalTrigger(minutes=DISK_QUOTA_SCAN_INTERVAL_MINUTES), id="disk-quota", max_instances=1, coalesce=True)
     scheduler.add_job(_reclaim_idle_gpu_containers, IntervalTrigger(minutes=5), id="idle-gpu-reclaim", max_instances=1, coalesce=True)
     scheduler.add_job(_recover_pending_merges, IntervalTrigger(minutes=5), id="recover-gpu-merges", max_instances=1, coalesce=True)
+    if NODE_ROLE == "master":
+        scheduler.add_job(_reconcile_pending_remote_shares, IntervalTrigger(minutes=1), id="reconcile-remote-shares", max_instances=1, coalesce=True)
     scheduler.start()
     logger.info("定时任务已启动")
 

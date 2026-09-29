@@ -111,3 +111,18 @@
   color: var(--sky-soft);
   font-weight: 700;
 }
+
+@media (max-width: 768px) {
+  .register-page {
+    min-height: 100dvh;
+    padding: 1rem;
+  }
+
+  .register-card {
+    padding: clamp(1.1rem, 5vw, 2rem);
+  }
+
+  .register-card h1 {
+    font-size: clamp(1.3rem, 5vw, 1.6rem);
+  }
+}

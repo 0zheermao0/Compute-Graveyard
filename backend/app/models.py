@@ -78,6 +78,7 @@ class ContainerOccupancy(BaseModel):
     gpu_index: int  # -1 表示 CPU 容器
     container_name: str
     username: str
+    origin: Optional[str] = None
     display_name: str
     real_name: Optional[str] = None
     contact_type: Optional[str] = None
@@ -110,12 +111,35 @@ class UsageRankItem(BaseModel):
     total_hours: float
 
 
+class DiskRankItem(BaseModel):
+    rank: int
+    username: str
+    real_name: Optional[str] = None
+    usage_bytes: int
+
+
+class GPUUtilRankItem(BaseModel):
+    rank: int
+    username: str
+    real_name: Optional[str] = None
+    estimated_percent: float
+
+
+class ReminderRankItem(BaseModel):
+    username: str
+    real_name: str
+    unread_count: int
+
+
 class GPUSharingStatus(BaseModel):
     """单卡共用占用情况（用于申请页展示全部 GPU）"""
     gpu_index: int
     occupant_count: int  # 当前该卡上不同用户数（运行中容器）
     max_sharing: int  # 管理员配置的单卡最多共用人数上限
     selectable: bool  # 是否仍可选择（未满员）
+    external_occupied: bool = False
+    unknown_occupant_count: int = 0
+    worker_shareable: bool = False
 
 
 class DashboardNode(BaseModel):
@@ -140,6 +164,10 @@ class DashboardResponse(BaseModel):
     all_containers: List[RunningContainerContact]
     weekly_ranking: List[UsageRankItem]
     monthly_ranking: List[UsageRankItem]
+    disk_ranking: List[DiskRankItem] = Field(default_factory=list)
+    weekly_gpu_ranking: List[GPUUtilRankItem] = Field(default_factory=list)
+    monthly_gpu_ranking: List[GPUUtilRankItem] = Field(default_factory=list)
+    reminder_ranking: List[ReminderRankItem] = Field(default_factory=list)
     gpu_sharing: List[GPUSharingStatus] = Field(default_factory=list)
     max_gpu_sharing_users: int = 4  # 与 gpu_sharing 中 max_sharing 一致，便于前端单独展示
     nodes: List[DashboardNode] = Field(default_factory=list)
@@ -217,13 +245,14 @@ class NotifyRequest(BaseModel):
 
 class NotificationItem(BaseModel):
     id: str
-    type: str  # share_approval_request | lease_renew_reminder_1d | share_waiting_for_others
+    type: str
     title: str
     message: str
     created_at: datetime
     container_id: Optional[int] = None
     container_name: Optional[str] = None
     gpu_ids: Optional[str] = None
+    read_at: Optional[datetime] = None
 
 
 class NotificationListResponse(BaseModel):

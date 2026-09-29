@@ -5,13 +5,15 @@ import logging
 import uuid
 from datetime import datetime, timedelta
 from functools import wraps
-from threading import RLock
+from app.api.agent import _create_lock
 
 from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy.exc import SQLAlchemyError
 
 from app.auth import get_current_user
 from app.database import get_db
-from app.database_models import ContainerModel, UserModel
+from app.database_models import ContainerModel, ShareRequestModel, UserModel, UserNotificationModel
+from app.worker_share import decide as decide_remote_share, require_current as require_remote_share_current, view as remote_share_view
 from app.models import (
     ContainerApplyRequest,
     ContainerApplyResult,
@@ -23,23 +25,23 @@ from app.models import (
 from app.config import (
     DEFAULT_LEASE_DAYS,
     MAX_LEASE_DAYS,
-    MAX_GPUS_PER_USER,
     MAX_CONTAINERS_PER_USER,
     DEFAULT_CPU_MEM_GB,
     DEFAULT_GPU_MEM_GB_PER_GPU,
     DEFAULT_MAX_GPU_SHARING_USERS,
     NODE_ID,
     NODE_NAME,
+    NODE_ROLE,
     NODE_PUBLIC_HOST,
 )
-from app.node_service import build_service_url, delete_provisioned_container, get_node, provision_on_node, select_node
+from app.node_service import build_service_url, delete_provisioned_container, get_node, inventory_for_node, provision_on_node, select_node, worker_share_snapshot
 from app.remote_agent import RemoteAgentClient, RemoteAgentError
 from app.docker_service import finalize_gpu_merge, merge_container_gpus, rollback_gpu_merge
 from app.database import get_setting
 from app.quota_service import check_user_can_provision
 
 router = APIRouter()
-_share_action_lock = RLock()
+_share_action_lock = _create_lock
 logger = logging.getLogger(__name__)
 
 
@@ -105,6 +107,131 @@ def _parse_share_payload(raw: str | None) -> dict | None:
         return None
 
 
+def _remote_share_status(db, c, payload):
+    node = get_node(db, c.node_id)
+    if not node or not node.enabled:
+        raise RemoteAgentError("Worker 节点不可用")
+    agent_client = RemoteAgentClient(node.base_url, node.agent_token)
+    status = (agent_client.recover_share(payload["request_id"]) if c.status in ("provisioning", "share_uncertain")
+              else agent_client.share_status(payload["request_id"]))
+    if not isinstance(status, dict) or status.get("request_id") != payload["request_id"]:
+        raise RemoteAgentError("Worker 申请身份不一致")
+    if status.get("occupancy") != payload["occupancy"]:
+        raise RemoteAgentError("Worker 申请占用快照不一致")
+    return node, agent_client, status
+
+
+def _finish_remote_share(db, c, payload, node, result):
+    provisioned = result.get("provision_result") if isinstance(result, dict) else None
+    if (not isinstance(provisioned, dict) or result.get("request_id") != payload["request_id"]
+            or result.get("state") != "provisioned" or result.get("occupancy") != payload["occupancy"]
+            or not isinstance(result.get("ssh_password"), str) or not result["ssh_password"]
+            or not isinstance(provisioned.get("container_id"), str) or not provisioned["container_id"]
+            or not isinstance(provisioned.get("ssh_port"), int) or isinstance(provisioned["ssh_port"], bool)
+            or not 1 <= provisioned["ssh_port"] <= 65535
+            or not isinstance(provisioned.get("extra_ports"), dict)):
+        raise RemoteAgentError("Worker 未返回完整的创建凭据")
+    c.container_id = provisioned["container_id"]
+    c.ssh_password = result["ssh_password"]
+    c.ssh_port = provisioned["ssh_port"]
+    c.extra_ports = json.dumps(provisioned["extra_ports"])
+    c.access_host = node.public_host or provisioned.get("public_host")
+    c.service_scheme = provisioned.get("service_scheme") if provisioned.get("service_scheme") in ("http", "https") else "http"
+    c.expires_at = datetime.now() + timedelta(days=payload["lease_days"])
+    c.pending_share_json = None
+    c.status = "running"
+    db.commit()
+
+
+def _remote_applicant_limits(db, c, gpu_ids):
+    if c.target_container_id is not None:
+        return False
+    active = db.query(ContainerModel).filter(
+        ContainerModel.user_id == c.user_id,
+        ContainerModel.id != c.id,
+        ContainerModel.status.in_(["running", "merging", "pending_share_approval", "provisioning", "share_uncertain"]),
+        ContainerModel.target_container_id.is_(None),
+    ).all()
+    if len(active) >= MAX_CONTAINERS_PER_USER:
+        return False
+    user = db.get(UserModel, c.user_id)
+    if not user:
+        return False
+    running = db.query(ContainerModel).filter(
+        ContainerModel.user_id == c.user_id,
+        ContainerModel.id != c.id,
+        ContainerModel.status.in_(["running", "merging", "provisioning", "share_uncertain"]),
+    ).all()
+    return sum(len(row.gpu_ids.split(",")) for row in running if row.gpu_ids) + len(gpu_ids) <= user.max_gpus_per_user
+
+
+def _reconcile_remote_shares(db, user_id):
+    rows = db.query(ContainerModel).filter(ContainerModel.user_id == user_id,
+        ContainerModel.status.in_(["pending_share_approval", "provisioning", "share_uncertain"])).all()
+    for c in rows:
+        payload = _parse_share_payload(c.pending_share_json)
+        if not payload or not payload.get("request_id"):
+            continue
+        try:
+            node, agent_client, status = _remote_share_status(db, c, payload)
+            state = status.get("state")
+            if c.status in ("provisioning", "share_uncertain"):
+                if state == "provisioned":
+                    _finish_remote_share(db, c, payload, node, status)
+                elif state == "uncertain":
+                    c.status = "share_uncertain"
+                    db.commit()
+                elif state in ("rejected", "cancelled", "expired"):
+                    c.status = "share_rejected"
+                    c.stopped_at = datetime.now()
+                    c.name = f"{c.name}-invalid-{c.id}"
+                    db.commit()
+                continue
+            if state in ("rejected", "cancelled", "expired"):
+                c.status = "share_rejected"
+                c.stopped_at = datetime.now()
+                c.name = f"{c.name}-invalid-{c.id}"
+                db.commit()
+                continue
+            if state == "uncertain":
+                c.status = "share_uncertain"
+                db.commit()
+                continue
+            if state not in ("pending", "approved"):
+                continue
+            approvers = status.get("approvers")
+            if (not isinstance(approvers, list) or not approvers or
+                    any(not isinstance(a, dict) or not isinstance(a.get("approved"), bool) or
+                        not isinstance(a.get("container_ids"), list) for a in approvers)):
+                continue
+            groups = {}
+            for item in payload["occupancy"]:
+                groups.setdefault(item["username"], set()).add(item["container_id"])
+            if {frozenset(a["container_ids"]) for a in approvers} != {frozenset(ids) for ids in groups.values()}:
+                continue
+            payload["approvers"] = [{"username": name, "approved": next(a["approved"] for a in approvers
+                                    if set(a["container_ids"]) == ids)} for name, ids in groups.items()]
+            c.pending_share_json = json.dumps(payload)
+            db.commit()
+            if state != "approved" or not all(a.get("approved") is True for a in approvers):
+                continue
+            user = db.get(UserModel, c.user_id)
+            if (not user or not node.enabled or not node.schedulable
+                    or not _remote_applicant_limits(db, c, payload["gpu_ids"])
+                    or not check_user_can_provision(db, user, commit=False).allowed):
+                continue
+            inventory = inventory_for_node(db, node)
+            if worker_share_snapshot(db, node.id, inventory, payload["gpu_ids"]) != payload["occupancy"]:
+                continue
+            c.status = "provisioning"
+            db.commit()
+            result = agent_client.provision_share(payload["request_id"])
+            _finish_remote_share(db, c, payload, node, result)
+        except (RemoteAgentError, ValueError, KeyError, TypeError, RuntimeError, SQLAlchemyError):
+            db.rollback()
+            logger.warning("Worker 共用申请 %s 暂不可调和", c.id)
+
+
 def _response_from_container(db, c: ContainerModel, owner_username: str | None = None) -> ContainerResponse:
     ep = json.loads(c.extra_ports) if c.extra_ports else {}
     ep_int = {int(k): v for k, v in ep.items()} if ep else None
@@ -116,6 +243,8 @@ def _response_from_container(db, c: ContainerModel, owner_username: str | None =
             pending_days = int(payload.get("lease_days", DEFAULT_LEASE_DAYS))
             share_list = []
             for a in payload.get("approvers") or []:
+                if "user_id" not in a:
+                    continue
                 at = a.get("approved_at")
                 share_list.append(
                     ShareApproverInfo(
@@ -300,11 +429,11 @@ def _provision_running_container(db, c: ContainerModel, lease_days: int, previou
 
     my_running = db.query(ContainerModel).filter(
         ContainerModel.user_id == c.user_id,
-        ContainerModel.status.in_(["running", "merging"]),
+        ContainerModel.status.in_(["running", "merging", "provisioning", "share_uncertain"]),
     ).all()
     total_gpus = sum(len(item.gpu_ids.split(",")) for item in my_running if item.gpu_ids)
-    if total_gpus + len(gpu_ids) > MAX_GPUS_PER_USER:
-        raise HTTPException(status_code=400, detail=f"每人最多使用 {MAX_GPUS_PER_USER} 块 GPU")
+    if total_gpus + len(gpu_ids) > user.max_gpus_per_user:
+        raise HTTPException(status_code=400, detail=f"每人最多使用 {user.max_gpus_per_user} 块 GPU")
 
     users_per_gpu = _distinct_users_per_gpu_map(db, c.node_id or NODE_ID)
     mx = _max_gpu_sharing(db)
@@ -402,15 +531,15 @@ def apply_container(req: ContainerApplyRequest, user=Depends(get_current_user), 
     if not req.cpu_only and gpu_ids:
         my_running = db.query(ContainerModel).filter(
             ContainerModel.user_id == user.id,
-            ContainerModel.status.in_(["running", "merging"]),
+            ContainerModel.status.in_(["running", "merging", "provisioning", "share_uncertain"]),
         ).all()
         total_gpus = sum(len(c.gpu_ids.split(",")) for c in my_running if c.gpu_ids)
-        if total_gpus + len(gpu_ids) > MAX_GPUS_PER_USER:
-            raise HTTPException(status_code=400, detail=f"每人最多使用 {MAX_GPUS_PER_USER} 块 GPU")
+        if total_gpus + len(gpu_ids) > user.max_gpus_per_user:
+            raise HTTPException(status_code=400, detail=f"每人最多使用 {user.max_gpus_per_user} 块 GPU")
 
     mx = _max_gpu_sharing(db)
     try:
-        node, _ = select_node(
+        node, inventory = select_node(
             db,
             "specific" if target else req.placement_mode,
             (target.node_id or NODE_ID) if target else req.node_id,
@@ -418,11 +547,58 @@ def apply_container(req: ContainerApplyRequest, user=Depends(get_current_user), 
             req.cpu_only,
             applicant_id=user.id,
             max_share=mx,
+            allow_worker_share=not target and req.placement_mode == "specific" and not req.cpu_only,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except RemoteAgentError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    if node.id != NODE_ID and req.placement_mode == "specific" and not target and gpu_ids:
+        try:
+            snapshot = worker_share_snapshot(db, node.id, inventory, gpu_ids)
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        if snapshot:
+            request_id = uuid.uuid4().hex
+            name = f"labgpu-{user.username}-{datetime.now().strftime('%Y%m%d%H%M')}-{uuid.uuid4().hex[:8]}"
+            memory = int(get_setting("gpu_mem_gb_per_gpu", str(DEFAULT_GPU_MEM_GB_PER_GPU))) * len(gpu_ids)
+            agent_client = RemoteAgentClient(node.base_url, node.agent_token)
+            try:
+                answer = agent_client.request_share({"request_id": request_id, "applicant": user.username,
+                    "username": user.username, "name": name, "gpu_ids": sorted(gpu_ids),
+                    "lease_days": req.lease_days, "mem_limit_gb": memory})
+                if (not isinstance(answer, dict) or answer.get("request_id") != request_id
+                        or answer.get("state") != "pending" or answer.get("occupancy") != snapshot):
+                    raise RemoteAgentError("Worker 返回的申请快照不一致")
+                fresh = inventory_for_node(db, node)
+                if worker_share_snapshot(db, node.id, fresh, gpu_ids) != snapshot:
+                    raise RemoteAgentError("Worker 占用状态已变化")
+                payload = {"request_id": request_id, "occupancy": snapshot, "gpu_ids": sorted(gpu_ids),
+                           "lease_days": req.lease_days, "approvers": []}
+                c = ContainerModel(container_id=f"pending-{request_id}", name=name, user_id=user.id,
+                    node_id=node.id, node_name=node.name, access_host=node.public_host,
+                    gpu_ids=",".join(map(str, sorted(gpu_ids))), ssh_port=0, status="pending_share_approval",
+                    expires_at=datetime.now() + timedelta(days=3650), pending_share_json=json.dumps(payload))
+                db.add(c)
+                db.commit()
+                db.refresh(c)
+            except (RemoteAgentError, ValueError, KeyError, TypeError):
+                db.rollback()
+                try:
+                    agent_client.cancel_share(request_id)
+                except RemoteAgentError:
+                    logger.exception("Worker 共用申请 %s 取消状态不确定", request_id)
+                raise HTTPException(status_code=502, detail="Worker 共用申请未能确认，请稍后重试")
+            except Exception:
+                db.rollback()
+                try:
+                    agent_client.cancel_share(request_id)
+                except RemoteAgentError:
+                    logger.exception("Worker 共用申请 %s 取消状态不确定", request_id)
+                raise
+            return ContainerApplyResult(container=_response_from_container(db, c, user.username),
+                pending_share_approval=True, message="已向 Worker 占用者发起共用申请")
 
     users_per_gpu = _distinct_users_per_gpu_map(db, node.id)
     if not _capacity_ok(gpu_ids, user.id, mx, users_per_gpu):
@@ -515,6 +691,46 @@ def apply_container(req: ContainerApplyRequest, user=Depends(get_current_user), 
     )
 
 
+def _worker_share_only():
+    if NODE_ROLE != "worker":
+        raise HTTPException(status_code=404, detail="Not Found")
+
+
+@router.get("/remote-share-requests")
+def remote_share_requests(user=Depends(get_current_user), db=Depends(get_db)):
+    _worker_share_only()
+    result = []
+    for row in db.query(ShareRequestModel).filter(ShareRequestModel.state == "pending").all():
+        if any(a["user_id"] == user.id and not a["approved"] for a in json.loads(row.approvers)):
+            try:
+                require_remote_share_current(db, row)
+            except HTTPException:
+                continue
+            result.append({**remote_share_view(row), "applicant": json.loads(row.payload)["applicant"],
+                           "gpu_ids": json.loads(row.payload)["gpu_ids"]})
+    return result
+
+
+@router.post("/remote-share-requests/{request_id}/approve")
+@_synchronized_share_action
+def approve_remote_share(request_id: str, user=Depends(get_current_user), db=Depends(get_db)):
+    _worker_share_only()
+    row = db.get(ShareRequestModel, request_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="申请不存在")
+    return decide_remote_share(db, row, user, True)
+
+
+@router.post("/remote-share-requests/{request_id}/reject")
+@_synchronized_share_action
+def reject_remote_share(request_id: str, user=Depends(get_current_user), db=Depends(get_db)):
+    _worker_share_only()
+    row = db.get(ShareRequestModel, request_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="申请不存在")
+    return decide_remote_share(db, row, user, False)
+
+
 @router.get("/share-awaiting-my-action", response_model=list[ContainerResponse])
 def list_share_requests_for_me(user=Depends(get_current_user), db=Depends(get_db)):
     """当前用户作为占用者时，待其同意的共用申请。"""
@@ -529,7 +745,7 @@ def list_share_requests_for_me(user=Depends(get_current_user), db=Depends(get_db
         payload = _parse_share_payload(c.pending_share_json)
         if not payload:
             continue
-        ids = {int(a["user_id"]) for a in payload.get("approvers") or []}
+        ids = {int(a["user_id"]) for a in payload.get("approvers") or [] if "user_id" in a}
         if user.id not in ids:
             continue
         mine = next((a for a in payload["approvers"] if int(a["user_id"]) == user.id), None)
@@ -540,9 +756,45 @@ def list_share_requests_for_me(user=Depends(get_current_user), db=Depends(get_db
     return result
 
 
+def pending_share_approver_ids(payload):
+    return {int(a["user_id"]) for a in payload.get("approvers", []) if "user_id" in a and not a.get("approved")}
+
+
+def lease_reminder_active(container, now):
+    return bool(container.expires_at and 0 < (container.expires_at - now).total_seconds() <= 24 * 3600)
+
+
+def remote_share_approver_ids(db, row):
+    try:
+        approvers = json.loads(row.approvers)
+        ids = {a["user_id"] for a in approvers if not a["approved"]}
+        if not ids:
+            return set()
+        require_remote_share_current(db, row)
+        return ids
+    except (HTTPException, ValueError, TypeError, KeyError):
+        return set()
+
+
+@router.post("/notifications/{notification_id}/read")
+def mark_notification_read(notification_id: int, user=Depends(get_current_user), db=Depends(get_db)):
+    event = db.query(UserNotificationModel).filter(
+        UserNotificationModel.id == notification_id, UserNotificationModel.user_id == user.id,
+    ).first()
+    if event is None:
+        raise HTTPException(status_code=404, detail="通知不存在")
+    if event.read_at is None:
+        event.read_at = datetime.now()
+        db.commit()
+    return {"id": event.id, "read_at": event.read_at}
+
+
 @router.get("/notifications", response_model=NotificationListResponse)
 def list_notifications(user=Depends(get_current_user), db=Depends(get_db)):
-    """聚合用户通知（实时计算，不落库）。"""
+    """聚合用户通知。"""
+    if NODE_ROLE == "master":
+        with _share_action_lock:
+            _reconcile_remote_shares(db, user.id)
     items: list[NotificationItem] = []
     now = datetime.now()
 
@@ -558,8 +810,7 @@ def list_notifications(user=Depends(get_current_user), db=Depends(get_db)):
         if not payload:
             continue
         approvers = payload.get("approvers") or []
-        mine = next((a for a in approvers if int(a["user_id"]) == user.id), None)
-        if mine and not mine.get("approved"):
+        if user.id in pending_share_approver_ids(payload):
             owner = db.query(UserModel).filter(UserModel.id == c.user_id).first()
             owner_name = owner.username if owner else "未知用户"
             items.append(
@@ -575,6 +826,19 @@ def list_notifications(user=Depends(get_current_user), db=Depends(get_db)):
                 )
             )
 
+    if NODE_ROLE == "worker":
+        for row in db.query(ShareRequestModel).filter(ShareRequestModel.state == "pending").all():
+            if user.id not in remote_share_approver_ids(db, row):
+                continue
+            payload = json.loads(row.payload)
+            items.append(NotificationItem(
+                id=f"remote-share-approval-{row.id}", type="remote_share_approval_request",
+                title="远端 GPU 共用申请待处理",
+                message=f"{payload['applicant']} 申请共用 GPU {','.join(map(str, payload['gpu_ids']))}，请同意或拒绝。",
+                created_at=row.created_at, container_name=payload["name"],
+                gpu_ids=",".join(map(str, payload["gpu_ids"])),
+            ))
+
     # 2) 我自己的容器到期前 24 小时提醒续租
     my_running = (
         db.query(ContainerModel)
@@ -586,10 +850,8 @@ def list_notifications(user=Depends(get_current_user), db=Depends(get_db)):
         .all()
     )
     for c in my_running:
-        if not c.expires_at:
-            continue
-        remaining = c.expires_at - now
-        if 0 < remaining.total_seconds() <= 24 * 3600:
+        if lease_reminder_active(c, now):
+            remaining = c.expires_at - now
             hours_left = max(1, int(remaining.total_seconds() // 3600))
             items.append(
                 NotificationItem(
@@ -634,8 +896,14 @@ def list_notifications(user=Depends(get_current_user), db=Depends(get_db)):
             )
         )
 
+    events = db.query(UserNotificationModel).filter(UserNotificationModel.user_id == user.id).all()
+    items.extend(NotificationItem(
+        id=f"event-{event.id}", type=event.type, title=event.title, message=event.message,
+        created_at=event.created_at, container_id=event.container_id,
+        container_name=event.container_name, read_at=event.read_at,
+    ) for event in events)
     items.sort(key=lambda x: x.created_at, reverse=True)
-    return NotificationListResponse(unread_count=len(items), items=items)
+    return NotificationListResponse(unread_count=sum(item.read_at is None for item in items), items=items)
 
 
 @router.post("/{container_id}/approve-share")
@@ -703,7 +971,7 @@ def reject_share(container_id: int, user=Depends(get_current_user), db=Depends(g
     if not payload:
         raise HTTPException(status_code=400, detail="无效的审批数据")
     approvers = payload.get("approvers") or []
-    if not any(int(a["user_id"]) == user.id for a in approvers):
+    if not any("user_id" in a and int(a["user_id"]) == user.id for a in approvers):
         raise HTTPException(status_code=403, detail="您不是该申请的待审批占用者")
 
     now = datetime.now()
@@ -717,6 +985,9 @@ def reject_share(container_id: int, user=Depends(get_current_user), db=Depends(g
 
 @router.get("/my", response_model=list[ContainerResponse])
 def my_containers(user=Depends(get_current_user), db=Depends(get_db)):
+    if NODE_ROLE == "master":
+        with _share_action_lock:
+            _reconcile_remote_shares(db, user.id)
     rows = (
         db.query(ContainerModel)
         .filter(
@@ -730,6 +1001,7 @@ def my_containers(user=Depends(get_current_user), db=Depends(get_db)):
 
 
 @router.delete("/{container_id}")
+@_synchronized_share_action
 def delete_container(container_id: int, user=Depends(get_current_user), db=Depends(get_db)):
     from app.container_lifecycle import remove_container_record
 
@@ -743,7 +1015,21 @@ def delete_container(container_id: int, user=Depends(get_current_user), db=Depen
     if c.status == "merging" or (c.status == "running" and c.pending_share_json and "old_id" in (_parse_share_payload(c.pending_share_json) or {})):
         raise HTTPException(status_code=409, detail="容器正在合并或等待清理，请稍后重试")
 
+    if c.status in ("provisioning", "share_uncertain"):
+        raise HTTPException(status_code=409, detail="Worker 创建结果待人工核查，不能取消")
+
     if c.status == "pending_share_approval":
+        payload = _parse_share_payload(c.pending_share_json)
+        if payload and payload.get("request_id"):
+            node = get_node(db, c.node_id)
+            if not node:
+                raise HTTPException(status_code=503, detail="Worker 节点不可用")
+            try:
+                result = RemoteAgentClient(node.base_url, node.agent_token).cancel_share(payload["request_id"])
+            except RemoteAgentError as exc:
+                raise HTTPException(status_code=503, detail=str(exc)) from exc
+            if result.get("state") != "cancelled" or result.get("request_id") != payload["request_id"]:
+                raise HTTPException(status_code=409, detail="Worker 申请未确认取消")
         c.status = "removed"
         c.stopped_at = datetime.now()
         c.name = f"{c.name}-cancel-{int(datetime.now().timestamp())}"

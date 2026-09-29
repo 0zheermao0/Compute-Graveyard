@@ -51,7 +51,8 @@ def test_merge_rejects_other_owner_cpu_and_overlap(state):
 
 def test_merge_quota_counts_only_added_gpus(state, monkeypatch):
     db, user, other, target = state
-    monkeypatch.setattr(containers, "MAX_GPUS_PER_USER", 2)
+    user.max_gpus_per_user = 2
+    db.commit()
     monkeypatch.setattr(containers, "_merge_action", lambda node, action, old_id, data: {"container_id": "new"} if action == "merge" else None)
     result = containers.apply_container(ContainerApplyRequest(target_container_id=target.id, gpu_ids=[1]), user=user, db=db)
     assert result.container.id == target.id
@@ -60,6 +61,56 @@ def test_merge_quota_counts_only_added_gpus(state, monkeypatch):
     assert target.expires_at < datetime.now() + timedelta(days=3)
     with pytest.raises(HTTPException):
         containers.apply_container(ContainerApplyRequest(target_container_id=target.id, gpu_ids=[2]), user=user, db=db)
+
+
+def test_gpu_limit_is_per_user_for_apply_and_cpu_only(state, monkeypatch):
+    db, user, other, target = state
+    user.max_gpus_per_user = 1
+    other.max_gpus_per_user = 3
+    db.commit()
+    with pytest.raises(HTTPException, match="最多使用 1"):
+        containers.apply_container(ContainerApplyRequest(gpu_ids=[1]), user=user, db=db)
+    monkeypatch.setattr(containers, "provision_on_node", lambda *args: {"container_id": "cpu-id", "ssh_port": 22002})
+    assert containers.apply_container(ContainerApplyRequest(cpu_only=True), user=user, db=db).container.gpu_ids == ""
+    user.max_gpus_per_user = 0
+    db.commit()
+    with pytest.raises(HTTPException, match="最多使用 0"):
+        containers.apply_container(ContainerApplyRequest(gpu_ids=[1]), user=user, db=db)
+    monkeypatch.setattr(containers, "provision_on_node", lambda *args: {"container_id": "gpu-id", "ssh_port": 22003})
+    assert containers.apply_container(ContainerApplyRequest(gpu_ids=[1, 2, 3]), user=other, db=db).container.gpu_ids == "1,2,3"
+    with pytest.raises(HTTPException, match="最多使用 3"):
+        containers.apply_container(ContainerApplyRequest(gpu_ids=[4]), user=other, db=db)
+
+
+def test_provisioning_remote_share_reserves_gpu_quota(state):
+    db, user, other, target = state
+    user.max_gpus_per_user = 2
+    db.add(ContainerModel(container_id="pending-remote", name="remote", user_id=user.id, node_id="remote", gpu_ids="1", ssh_port=0, status="provisioning", expires_at=datetime.now() + timedelta(days=2)))
+    db.commit()
+    with pytest.raises(HTTPException, match="最多使用 2"):
+        containers.apply_container(ContainerApplyRequest(gpu_ids=[2]), user=user, db=db)
+    remote = db.query(ContainerModel).filter_by(container_id="pending-remote").one()
+    remote.status = "share_uncertain"
+    db.commit()
+    with pytest.raises(HTTPException, match="最多使用 2"):
+        containers.apply_container(ContainerApplyRequest(gpu_ids=[2]), user=user, db=db)
+
+
+def test_approval_rechecks_applicant_stored_gpu_limit(state, monkeypatch):
+    db, user, other, target = state
+    db.add(ContainerModel(container_id="other", name="other", user_id=other.id, node_id="local", gpu_ids="1", ssh_port=22002, status="running", expires_at=datetime.now() + timedelta(days=2)))
+    db.commit()
+    pending_id = containers.apply_container(ContainerApplyRequest(gpu_ids=[1]), user=user, db=db).container.id
+    user.max_gpus_per_user = 1
+    db.commit()
+    with pytest.raises(HTTPException, match="最多使用 1"):
+        containers.approve_share(pending_id, user=other, db=db)
+    db.refresh(db.get(ContainerModel, pending_id))
+    assert not json.loads(db.get(ContainerModel, pending_id).pending_share_json)["approvers"][0]["approved"]
+    user.max_gpus_per_user = 2
+    db.commit()
+    monkeypatch.setattr(containers, "provision_on_node", lambda *args: {"container_id": "approved-id", "ssh_port": 22003})
+    assert containers.approve_share(pending_id, user=other, db=db)["message"] == "已全部同意，容器已创建"
 
 
 def test_pending_merge_rechecks_occupiers_and_target(state, monkeypatch):

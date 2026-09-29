@@ -1,4 +1,4 @@
-import { X, HelpCircle, Cpu, Terminal, FileText, Code } from "lucide-react";
+import { X, HelpCircle, Cpu, Terminal, FileText, Code, HardDrive, Trash2, Activity } from "lucide-react";
 
 interface InstructionModalProps {
     onClose: () => void;
@@ -38,6 +38,21 @@ export default function InstructionModal({ onClose }: InstructionModalProps) {
                     <section className="ins-section">
                         <h3><Code size={18} /> 4. 如何使用 Code-Server (在线 VSCode)</h3>
                         <p>系统默认在容器内预装了 Web 版 VSCode。在 <strong>我的容器</strong> 页面，点击 <strong>“打开 VS Code”</strong> 按钮，即可在浏览器中通过熟悉的 VSCode 界面进行开发。环境已经配置好 Conda ,创建好的环境会持久化在个人目录中，后续申请使用不会丢失。</p>
+                    </section>
+
+                    <section className="ins-section">
+                        <h3><HardDrive size={18} /> 5. 磁盘占用限制</h3>
+                        <p>个人工作区默认配额为 <strong>100 GiB</strong>（具体以“工作区”页面显示为准）。使用量达到配额后将无法申请新容器；连续超限满默认 <strong>24 小时</strong>后，运行中的容器会自动停止。请及时清理工作区文件；停止超过 24 小时的容器会被自动清理，工作区数据仍保留。</p>
+                    </section>
+
+                    <section className="ins-section">
+                        <h3><Trash2 size={18} /> 6. 容器销毁与数据保存</h3>
+                        <p>容器租期到期或被手动销毁后，容器内未保存到 <code>/workspace</code> 的数据会丢失。请提前将代码和重要文件保存到 <code>/workspace</code>；容器销毁后该目录仍会保留。</p>
+                    </section>
+
+                    <section className="ins-section">
+                        <h3><Activity size={18} /> 7. GPU 低利用率自动销毁</h3>
+                        <p>启用低利用率回收时，仅 GPU 容器受影响：分配的每张 GPU 的利用率和显存占用率均持续低于阈值（默认各 <strong>5%</strong>）满默认 <strong>24 小时</strong>，容器将自动停止并销毁；<code>/workspace</code> 数据保留。CPU 容器不受此规则影响，具体阈值和时长以管理员设置为准。</p>
                     </section>
 
                     <div className="modal-hint" style={{ marginTop: '1.5rem', background: 'rgba(52, 211, 153, 0.1)', borderColor: 'rgba(52, 211, 153, 0.2)', color: '#34d399' }}>

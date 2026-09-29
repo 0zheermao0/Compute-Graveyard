@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import { fetcher } from "../api/client";
 import ApplyModal from "../components/ApplyModal";
 import GPUTwin from "../components/GPUTwin";
@@ -49,11 +49,37 @@ interface UsageRankItem {
   total_hours: number;
 }
 
-interface GpuSharingStatus {
+interface DiskRankItem {
+  rank: number;
+  username: string;
+  real_name?: string | null;
+  usage_bytes: number;
+}
+
+interface GPUUtilRankItem {
+  rank: number;
+  username: string;
+  real_name?: string | null;
+  estimated_percent: number;
+}
+
+interface ReminderRankItem {
+  username: string;
+  real_name: string;
+  unread_count: number;
+}
+
+type RankingCategory = "duration" | "disk" | "gpu";
+const rankingCategories: RankingCategory[] = ["duration", "disk", "gpu"];
+
+export interface GpuSharingStatus {
   gpu_index: number;
   occupant_count: number;
+  unknown_occupant_count?: number;
   max_sharing: number;
   selectable: boolean;
+  external_occupied?: boolean;
+  worker_shareable?: boolean;
 }
 
 interface QuotaStatus {
@@ -107,6 +133,10 @@ interface DashboardData {
   all_containers: RunningContainer[];
   weekly_ranking: UsageRankItem[];
   monthly_ranking: UsageRankItem[];
+  disk_ranking: DiskRankItem[];
+  weekly_gpu_ranking: GPUUtilRankItem[];
+  monthly_gpu_ranking: GPUUtilRankItem[];
+  reminder_ranking: ReminderRankItem[];
   gpu_sharing?: GpuSharingStatus[];
   max_gpu_sharing_users?: number;
   nodes?: DashboardNode[];
@@ -116,23 +146,97 @@ export default function Dashboard() {
   const [data, setData] = useState<DashboardData | null>(null);
   const [error, setError] = useState("");
   const [showApply, setShowApply] = useState(false);
-  const [rankMode, setRankMode] = useState<"weekly" | "monthly">("weekly");
+  const [isMaster, setIsMaster] = useState(false);
+  const [rankCategory, setRankCategory] = useState<RankingCategory>("duration");
+  const [rankPeriod, setRankPeriod] = useState<"weekly" | "monthly">("weekly");
+  const [rankHovered, setRankHovered] = useState(false);
+  const [rankFocused, setRankFocused] = useState(false);
+  const [reducedMotion, setReducedMotion] = useState(() => window.matchMedia("(prefers-reduced-motion: reduce)").matches);
   const [quota, setQuota] = useState<QuotaStatus | null>(null);
   const [quotaLoading, setQuotaLoading] = useState(true);
   const [quotaError, setQuotaError] = useState(false);
+  const [remoteLoaded, setRemoteLoaded] = useState(false);
+  const [remoteError, setRemoteError] = useState("");
+  const localPending = useRef(false);
+  const remotePending = useRef(false);
+  const remoteLoadedRef = useRef(false);
+  const mounted = useRef(false);
+  const localRequestId = useRef(0);
+  const appliedLocalRequestId = useRef(0);
 
-  const load = async () => {
+  const normalizeData = (d: DashboardData): DashboardData => ({
+    ...d,
+    weekly_ranking: d.weekly_ranking ?? [],
+    monthly_ranking: d.monthly_ranking ?? [],
+    disk_ranking: d.disk_ranking ?? [],
+    weekly_gpu_ranking: d.weekly_gpu_ranking ?? [],
+    monthly_gpu_ranking: d.monthly_gpu_ranking ?? [],
+    reminder_ranking: d.reminder_ranking ?? [],
+    gpu_sharing: d.gpu_sharing ?? [],
+  });
+
+  const loadLocal = async () => {
+    if (localPending.current) return;
+    localPending.current = true;
+    const requestId = ++localRequestId.current;
     try {
-      const d = await fetcher<DashboardData>("/dashboard");
-      setData({
-        ...d,
-        weekly_ranking: d.weekly_ranking ?? [],
-        monthly_ranking: d.monthly_ranking ?? [],
-        gpu_sharing: d.gpu_sharing ?? [],
+      const local = normalizeData(await fetcher<DashboardData>("/dashboard?local_only=true"));
+      if (!mounted.current || requestId < appliedLocalRequestId.current) return;
+      appliedLocalRequestId.current = requestId;
+      setData((previous) => {
+        if (!previous || !remoteLoadedRef.current) return local;
+        const localNode = local.nodes?.find((node) => node.is_local);
+        return {
+          ...previous,
+          gpus: local.gpus,
+          system_load: local.system_load,
+          gpu_sharing: local.gpu_sharing,
+          nodes: previous.nodes?.map((node) => node.is_local && localNode ? localNode : node),
+        };
       });
       setError("");
     } catch (e) {
-      setError(e instanceof Error ? e.message : "加载失败");
+      if (mounted.current) setError(e instanceof Error ? e.message : "加载失败");
+    } finally {
+      localPending.current = false;
+    }
+  };
+
+  const loadRemote = async () => {
+    if (remotePending.current) return;
+    remotePending.current = true;
+    const requestId = ++localRequestId.current;
+    try {
+      const full = normalizeData(await fetcher<DashboardData>("/dashboard"));
+      if (!mounted.current) return;
+      const preserveLocal = requestId < appliedLocalRequestId.current;
+      if (!preserveLocal) appliedLocalRequestId.current = requestId;
+      setData((previous) => {
+        const localNode = preserveLocal ? previous?.nodes?.find((node) => node.is_local) : undefined;
+        return {
+          ...full,
+          gpus: localNode?.gpus ?? full.gpus,
+          gpu_sharing: localNode?.gpu_sharing ?? full.gpu_sharing,
+          system_load: localNode?.system_load ?? full.system_load,
+          nodes: full.nodes?.map((node) => node.is_local && localNode ? localNode : node),
+        };
+      });
+      remoteLoadedRef.current = true;
+      setRemoteLoaded(true);
+      setRemoteError("");
+      setError("");
+    } catch (e) {
+      if (mounted.current) {
+        setRemoteError(e instanceof Error ? e.message : "远端节点加载失败");
+        remoteLoadedRef.current = false;
+        setRemoteLoaded(false);
+        setData((previous) => previous ? {
+          ...previous,
+          nodes: previous.nodes?.map((node) => node.is_local ? node : { ...node, online: false, gpus: [], gpu_sharing: [], occupancies: [] }),
+        } : previous);
+      }
+    } finally {
+      remotePending.current = false;
     }
   };
 
@@ -153,16 +257,49 @@ export default function Dashboard() {
   };
 
   useEffect(() => {
-    load();
+    let active = true;
+    mounted.current = true;
+    fetcher<{ role: string }>("/health").then((health) => {
+      if (active) setIsMaster(health.role === "master");
+    }).catch(() => {
+      if (active) setIsMaster(false);
+    });
+    loadLocal();
+    loadRemote();
     loadQuota(true);
     const id = setInterval(() => {
-      load();
+      loadLocal();
+      loadRemote();
       loadQuota();
     }, 10000);
-    return () => clearInterval(id);
+    return () => {
+      active = false;
+      mounted.current = false;
+      clearInterval(id);
+    };
   }, []);
 
-  const ranking = rankMode === "weekly" ? (data?.weekly_ranking ?? []) : (data?.monthly_ranking ?? []);
+  useEffect(() => {
+    const preference = window.matchMedia("(prefers-reduced-motion: reduce)");
+    const updatePreference = () => setReducedMotion(preference.matches);
+    preference.addEventListener("change", updatePreference);
+    updatePreference();
+    return () => preference.removeEventListener("change", updatePreference);
+  }, []);
+
+  useEffect(() => {
+    if (rankHovered || rankFocused || reducedMotion) return;
+    const id = setInterval(() => {
+      setRankCategory((category) => rankingCategories[(rankingCategories.indexOf(category) + 1) % rankingCategories.length]);
+    }, 6000);
+    return () => clearInterval(id);
+  }, [rankHovered, rankFocused, rankCategory, reducedMotion]);
+
+  const ranking = rankCategory === "disk"
+    ? (data?.disk_ranking ?? [])
+    : rankCategory === "gpu"
+      ? (rankPeriod === "weekly" ? data?.weekly_gpu_ranking ?? [] : data?.monthly_gpu_ranking ?? [])
+      : (rankPeriod === "weekly" ? data?.weekly_ranking ?? [] : data?.monthly_ranking ?? []);
   const dashboardNodes: DashboardNode[] = data
     ? data.nodes?.length
       ? data.nodes
@@ -234,13 +371,13 @@ export default function Dashboard() {
                     <code>{node.node_id}</code>
                   </div>
                   <div className="dashboard-node-badges">
-                    <span>{node.online ? "在线" : "离线"}</span>
+                     <span>{node.online ? "在线" : !node.is_local && !remoteLoaded && !remoteError ? "加载中" : "离线"}</span>
                     <span>{node.schedulable ? "可调度" : "不可调度"}</span>
                     <span>{node.container_count} 个容器</span>
                   </div>
                 </div>
                 {node.public_host && <div className="dashboard-node-host">{node.public_host}</div>}
-                {node.error && <div className="dashboard-node-error">{node.error}</div>}
+                 {(node.error || (!node.is_local && !remoteLoaded && remoteError)) && <div className="dashboard-node-error">{node.error || remoteError}</div>}
                 {node.system_load && (
                   <div className="load-cards dashboard-node-load">
                     <div className="load-card"><span className="load-label">CPU</span><span className="load-value">{node.system_load.cpu_percent}%</span></div>
@@ -249,9 +386,9 @@ export default function Dashboard() {
                   </div>
                 )}
                 {node.online ? (
-                  <GPUTwin gpus={node.gpus} occupancies={node.occupancies} />
+                  <GPUTwin gpus={node.gpus} occupancies={node.occupancies} gpuSharing={node.gpu_sharing} />
                 ) : (
-                  <div className="dashboard-node-unavailable">节点资源暂不可用</div>
+                   <div className="dashboard-node-unavailable">{!node.is_local && !remoteLoaded && !remoteError ? "正在加载节点资源…" : "节点资源暂不可用"}</div>
                 )}
               </article>
             ))}
@@ -302,29 +439,30 @@ export default function Dashboard() {
 
         </div>
 
-        <aside className="ranking-panel">
-          <h2>使用时长排行</h2>
-          <div className="ranking-tabs">
-            <button
-              className={rankMode === "weekly" ? "active" : ""}
-              onClick={() => setRankMode("weekly")}
-            >
-              本周
-            </button>
-            <button
-              className={rankMode === "monthly" ? "active" : ""}
-              onClick={() => setRankMode("monthly")}
-            >
-              本月
-            </button>
+        <div className="dashboard-sidebar">
+        <aside className="ranking-panel" onMouseEnter={() => setRankHovered(true)} onMouseLeave={() => setRankHovered(false)} onFocusCapture={() => setRankFocused(true)} onBlurCapture={(event) => { if (!event.currentTarget.contains(event.relatedTarget)) setRankFocused(false); }}>
+          <h2>{rankCategory === "duration" ? "使用时长排行" : rankCategory === "disk" ? "磁盘使用排行" : "GPU 平均利用率排行 · 估算"}</h2>
+          <div className="ranking-tabs" aria-label="排行类型">
+            {rankingCategories.map((category) => (
+              <button key={category} type="button" className={rankCategory === category ? "active" : ""} aria-pressed={rankCategory === category} onClick={() => setRankCategory(category)}>
+                {category === "duration" ? "时长" : category === "disk" ? "磁盘" : "GPU"}
+              </button>
+            ))}
           </div>
-          <ul className="ranking-list">
+          {rankCategory !== "disk" && (
+            <div className="ranking-tabs" aria-label="排行周期">
+              <button type="button" className={rankPeriod === "weekly" ? "active" : ""} aria-pressed={rankPeriod === "weekly"} onClick={() => setRankPeriod("weekly")}>本周</button>
+              <button type="button" className={rankPeriod === "monthly" ? "active" : ""} aria-pressed={rankPeriod === "monthly"} onClick={() => setRankPeriod("monthly")}>本月</button>
+            </div>
+          )}
+          <p className="ranking-note">{rankCategory === "disk" ? "当前已完成扫描的用户空间快照；非周/月累计" : rankCategory === "gpu" ? "估算：当前整卡利用率 × (0.7 + 0.3 × 显存占比)，按已验证运行占用人数均分，再按窗口内占用时长加权；非历史实测" : "容器累计使用时长"}</p>
+          <ul className="ranking-list" key={`${rankCategory}-${rankCategory === "disk" ? "current" : rankPeriod}`}>
             {ranking.length ? (
               ranking.map((r) => (
-                <li key={r.username}>
+                <li key={"estimated_percent" in r ? `${r.username}-${r.real_name}` : r.username}>
                   <span className="rank-num">{r.rank}</span>
                   <span className="rank-user">{r.real_name || r.username}</span>
-                  <span className="rank-hours">{r.total_hours}h</span>
+                  <span className="rank-hours">{"usage_bytes" in r ? formatGiB(r.usage_bytes) : "estimated_percent" in r ? `${r.estimated_percent}%` : `${r.total_hours}h`}</span>
                 </li>
               ))
             ) : (
@@ -332,16 +470,33 @@ export default function Dashboard() {
             )}
           </ul>
         </aside>
+        {!!data?.reminder_ranking?.length && (
+          <aside className="ranking-panel reminder-panel" aria-labelledby="reminder-heading">
+            <h2 id="reminder-heading">提醒ta</h2>
+            <ul className="ranking-list">
+              {data.reminder_ranking.map((user, index) => (
+                <li key={user.username}>
+                  <span className="rank-num">{index + 1}</span>
+                  <span className="rank-user">{user.real_name || user.username}</span>
+                  <span className="rank-hours" aria-label={`${user.unread_count} 条待处理通知`}>{user.unread_count} 条</span>
+                </li>
+              ))}
+            </ul>
+          </aside>
+        )}
+        </div>
       </div>
 
       {showApply && (
         <ApplyModal
           gpuSharing={data?.gpu_sharing ?? []}
           nodes={dashboardNodes}
+          isMaster={isMaster}
           onClose={() => setShowApply(false)}
           onSuccess={() => {
             setShowApply(false);
-            load();
+            loadLocal();
+            loadRemote();
           }}
         />
       )}

@@ -72,11 +72,29 @@ class RemoteAgentClient:
     def inventory(self) -> dict:
         return self._request("GET", "/inventory")
 
+    def owners_for_worker(self, node_id: str) -> dict:
+        return self._request("GET", f"/owners/{quote(node_id, safe='')}")
+
     def list_containers(self) -> list[dict]:
         return self._request("GET", "/containers")
 
     def create_container(self, payload: dict) -> dict:
         return self._request("POST", "/containers", json=payload)
+
+    def request_share(self, payload: dict) -> dict:
+        return self._request("POST", "/share-requests", json=payload)
+
+    def share_status(self, request_id: str) -> dict:
+        return self._request("GET", f"/share-requests/{quote(request_id, safe='')}")
+
+    def recover_share(self, request_id: str) -> dict:
+        return self.share_status(request_id)
+
+    def provision_share(self, request_id: str) -> dict:
+        return self._request("POST", f"/share-requests/{quote(request_id, safe='')}/provision", timeout=AGENT_MERGE_TIMEOUT_SECONDS)
+
+    def cancel_share(self, request_id: str) -> dict:
+        return self._request("DELETE", f"/share-requests/{quote(request_id, safe='')}")
 
     def merge_container(self, container_id: str, payload: dict) -> dict:
         return self._request("POST", f"/containers/{quote(container_id, safe='')}/merge", json=payload, timeout=AGENT_MERGE_TIMEOUT_SECONDS)

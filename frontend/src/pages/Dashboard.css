@@ -126,9 +126,16 @@
 }
 
 /* ========== 使用时长排行面板 ========== */
+.dashboard-sidebar {
+  flex: 0 0 220px;
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+  min-width: 0;
+}
+
 .ranking-panel {
-  flex-shrink: 0;
-  width: 220px;
+  width: 100%;
   background: rgba(255, 255, 255, 0.05);
   backdrop-filter: blur(16px);
   -webkit-backdrop-filter: blur(16px);
@@ -177,10 +184,27 @@
   border-color: rgba(16, 185, 129, 0.6);
 }
 
+.ranking-note {
+  color: var(--text-muted);
+  font-size: 0.72rem;
+  line-height: 1.5;
+  margin: 0 0 0.5rem;
+}
+
 .ranking-list {
+  animation: ranking-enter 0.35s ease-out;
   list-style: none;
   padding: 0;
   margin: 0;
+}
+
+@keyframes ranking-enter {
+  from { opacity: 0; transform: translateY(8px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .ranking-panel, .ranking-list { animation: none; }
 }
 
 .ranking-list li {
@@ -592,13 +616,70 @@
   margin-bottom: 0;
 }
 
-@media (max-width: 1024px) {
+@media (max-width: 1200px) {
   .dashboard-body {
     flex-direction: column;
   }
 
-  .ranking-panel {
+  .dashboard-sidebar {
     width: 100%;
     max-width: 400px;
+    flex: none;
+  }
+}
+
+.occupancy-table .table-wrap {
+  max-width: 100%;
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+}
+
+.occupancy-table table {
+  min-width: 600px;
+}
+
+.dashboard-node-header > div:first-child {
+  min-width: 0;
+  flex-wrap: wrap;
+}
+
+@media (max-width: 768px) {
+  .dashboard-body, .dashboard-main, .dashboard-node, .system-load, .gpu-section {
+    min-width: 0;
+    width: 100%;
+  }
+
+  .dashboard-header {
+    align-items: stretch;
+  }
+
+  .dashboard-header h1 {
+    width: 100%;
+  }
+
+  .dashboard-header .btn-primary {
+    flex: 1;
+  }
+
+  .gpu-grid {
+    grid-template-columns: repeat(auto-fit, minmax(min(100%, 240px), 1fr));
+    gap: 0.75rem;
+  }
+
+  .gpu-card, .dashboard-node {
+    padding: 0.85rem;
+  }
+
+  .load-cards {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(min(100%, 140px), 1fr));
+  }
+
+  .load-card {
+    min-width: 0;
+  }
+
+  .dashboard-sidebar {
+    max-width: none;
   }
 }

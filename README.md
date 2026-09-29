@@ -290,7 +290,7 @@ Docker Compose 会读取项目根目录的 `.env`，也可以直接设置环境�
 | 变量 | 说明 | 默认 |
 |------|------|------|
 | `DEFAULT_LEASE_DAYS` / `MAX_LEASE_DAYS` | 默认和最大租期 | `3` / `7` |
-| `MAX_GPUS_PER_USER` | 每个用户最多同时使用的 GPU 数 | `2` |
+| `MAX_GPUS_PER_USER` | 新用户的 GPU 配额默认值（管理员可通过 `PUT /api/admin/users/{user_id}/gpu-quota` 单独调整，设为 `0` 禁用 GPU 申请） | `2` |
 | `MAX_CONTAINERS_PER_USER` | 每个用户最多同时拥有的运行中或待审批容器数 | `4` |
 | `DEFAULT_CPU_MEM_GB` | CPU 容器默认内存限制 | `8` GB |
 | `DEFAULT_GPU_MEM_GB_PER_GPU` | 每块 GPU 对应的默认容器内存限制 | `32` GB |

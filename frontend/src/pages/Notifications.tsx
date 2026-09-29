@@ -4,7 +4,7 @@ import { fetcher } from "../api/client";
 import "./MyContainers.css";
 import "./Admin.css";
 
-type NotificationType = "share_approval_request" | "lease_renew_reminder_1d" | "share_waiting_for_others";
+type NotificationType = "share_approval_request" | "remote_share_approval_request" | "lease_renew_reminder_1d" | "share_waiting_for_others" | "disk_usage_90" | "disk_usage_100" | "disk_quota_stopped" | "disk_quota_destroyed" | "gpu_idle_reclaimed";
 
 interface NotificationItem {
   id: string;
@@ -15,6 +15,7 @@ interface NotificationItem {
   container_id?: number | null;
   container_name?: string | null;
   gpu_ids?: string | null;
+  read_at?: string | null;
 }
 
 interface NotificationResponse {
@@ -49,20 +50,32 @@ export default function Notifications() {
 
   const grouped = useMemo(() => {
     return items.map((item) => {
-      if (item.type === "share_approval_request") return { ...item, category: "审批", priority: 1 };
-      if (item.type === "lease_renew_reminder_1d") return { ...item, category: "续租", priority: 2 };
-      return { ...item, category: "进度", priority: 3 };
+      if (item.type === "share_approval_request" || item.type === "remote_share_approval_request") return { ...item, category: "审批", priority: 1 };
+       if (item.type === "lease_renew_reminder_1d") return { ...item, category: "续租", priority: 2 };
+       if (item.type.startsWith("disk_")) return { ...item, category: "磁盘", priority: 2 };
+       if (item.type === "gpu_idle_reclaimed") return { ...item, category: "回收", priority: 2 };
+       return { ...item, category: "进度", priority: 3 };
     }).sort((a, b) => {
       if (a.priority !== b.priority) return a.priority - b.priority;
       return new Date(b.created_at).getTime() - new Date(a.created_at).getTime();
     });
   }, [items]);
 
+  const approvalPath = (item: NotificationItem, action: "approve" | "reject") => {
+    if (item.type === "remote_share_approval_request") {
+      const prefix = "remote-share-approval-";
+      const requestId = item.id.startsWith(prefix) ? item.id.slice(prefix.length) : "";
+      return requestId ? `/containers/remote-share-requests/${encodeURIComponent(requestId)}/${action}` : null;
+    }
+    return item.container_id ? `/containers/${item.container_id}/${action}-share` : null;
+  };
+
   const handleApprove = async (item: NotificationItem) => {
-    if (!item.container_id) return;
+    const path = approvalPath(item, "approve");
+    if (!path) return;
     setBusyId(item.id);
     try {
-      await fetcher(`/containers/${item.container_id}/approve-share`, { method: "POST", body: "{}" });
+      await fetcher(path, { method: "POST", body: "{}" });
       await load();
     } catch (e) {
       alert(e instanceof Error ? e.message : "操作失败");
@@ -72,11 +85,25 @@ export default function Notifications() {
   };
 
   const handleReject = async (item: NotificationItem) => {
-    if (!item.container_id) return;
+    const path = approvalPath(item, "reject");
+    if (!path) return;
     if (!confirm("确定拒绝该 GPU 共用申请？")) return;
     setBusyId(item.id);
     try {
-      await fetcher(`/containers/${item.container_id}/reject-share`, { method: "POST", body: "{}" });
+      await fetcher(path, { method: "POST", body: "{}" });
+      await load();
+    } catch (e) {
+      alert(e instanceof Error ? e.message : "操作失败");
+    } finally {
+      setBusyId(null);
+    }
+  };
+
+  const markRead = async (item: NotificationItem) => {
+    if (!item.id.startsWith("event-") || item.read_at) return;
+    setBusyId(item.id);
+    try {
+      await fetcher(`/containers/notifications/${item.id.slice(6)}/read`, { method: "POST" });
       await load();
     } catch (e) {
       alert(e instanceof Error ? e.message : "操作失败");
@@ -99,7 +126,8 @@ export default function Notifications() {
       ) : (
         <section className="admin-section">
           <h2>通知列表</h2>
-          <table className="admin-table">
+          <div className="admin-table-wrap">
+            <table className="admin-table notifications-table">
             <thead>
               <tr>
                 <th>类型</th>
@@ -117,7 +145,7 @@ export default function Notifications() {
                   <td style={{ maxWidth: 460 }}>{n.message}</td>
                   <td>{new Date(n.created_at).toLocaleString()}</td>
                   <td>
-                    {n.type === "share_approval_request" ? (
+                    {n.type === "share_approval_request" || n.type === "remote_share_approval_request" ? (
                       <>
                         <button className="btn btn-primary btn-sm" disabled={busyId === n.id} onClick={() => handleApprove(n)}>
                           {busyId === n.id ? "处理中..." : "同意"}
@@ -131,16 +159,20 @@ export default function Notifications() {
                           拒绝
                         </button>
                       </>
+                    ) : n.id.startsWith("event-") ? (
+                      <>
+                        {n.type.startsWith("disk_usage_") && <button className="btn btn-frosted btn-sm" onClick={() => navigate("/workspace")}>查看工作区</button>}
+                        {!n.type.startsWith("disk_usage_") && <button className="btn btn-frosted btn-sm" onClick={() => navigate("/my")}>前往我的容器</button>}
+                        {!n.read_at && <button className="btn btn-frosted btn-sm" style={{ marginLeft: "0.5rem" }} disabled={busyId === n.id} onClick={() => markRead(n)}>标为已读</button>}
+                      </>
                     ) : (
-                      <button className="btn btn-frosted btn-sm" onClick={() => navigate("/my")}>
-                        前往我的容器
-                      </button>
+                      <button className="btn btn-frosted btn-sm" onClick={() => navigate("/my")}>前往我的容器</button>
                     )}
                   </td>
                 </tr>
               ))}
             </tbody>
-          </table>
+          </table></div>
         </section>
       )}
     </div>

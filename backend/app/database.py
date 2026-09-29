@@ -13,6 +13,7 @@ from app.config import (
     DEFAULT_DISK_QUOTA_BYTES,
     INITIAL_ADMIN_PASSWORD,
     INITIAL_ADMIN_USERNAME,
+    MAX_GPUS_PER_USER,
     NODE_ID,
     NODE_NAME,
     NODE_PUBLIC_HOST,
@@ -49,6 +50,8 @@ def init_db():
     _migrate_system_settings()
     _migrate_pending_share_json()
     _migrate_disk_quota()
+    _add_missing_columns(engine, "users", {"disk_notification_band": "INTEGER NOT NULL DEFAULT 0"})
+    _migrate_gpu_quota()
     _migrate_container_stop_reason()
     _migrate_compute_nodes()
     _migrate_container_merge()
@@ -125,6 +128,15 @@ def _migrate_disk_quota(bind=None):
         conn.execute(text("UPDATE users SET disk_usage_bytes = 0 WHERE disk_usage_bytes IS NULL"))
         conn.execute(text("UPDATE users SET disk_usage_scan_complete = :complete WHERE disk_usage_scan_complete IS NULL"), {"complete": False})
         conn.execute(text("UPDATE users SET disk_quota_blocked = :blocked WHERE disk_quota_blocked IS NULL"), {"blocked": False})
+
+
+def _migrate_gpu_quota(bind=None):
+    if bind is None:
+        bind = engine
+    _add_missing_columns(bind, "users", {"max_gpus_per_user": f"INTEGER NOT NULL DEFAULT {MAX_GPUS_PER_USER}"})
+    if inspect(bind).has_table("users"):
+        with bind.begin() as conn:
+            conn.execute(text("UPDATE users SET max_gpus_per_user = :limit WHERE max_gpus_per_user IS NULL"), {"limit": MAX_GPUS_PER_USER})
 
 
 def _migrate_container_stop_reason(bind=None):

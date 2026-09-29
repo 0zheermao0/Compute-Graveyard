@@ -4,12 +4,12 @@ import re
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Body, Depends, HTTPException
 from pydantic import BaseModel
 
 from app.auth import get_current_admin
 from app.database import get_db
-from app.database_models import UserModel, ContainerModel, LeaseRecordModel, ComputeNodeModel
+from app.database_models import UserModel, ContainerModel, LeaseRecordModel, ComputeNodeModel, UserNotificationModel
 from app.models import UserCreate, UserResponse
 from app.auth import get_password_hash
 from app.container_lifecycle import merge_cleanup_pending, remove_container_record
@@ -181,6 +181,7 @@ def list_users(admin=Depends(get_current_admin), db=Depends(get_db)):
             "approved": bool(getattr(u, "approved", 1)),
             "role": u.role,
             "created_at": u.created_at,
+            "max_gpus_per_user": u.max_gpus_per_user,
             "disk_quota_bytes": quota.quota_bytes,
             "disk_usage_bytes": quota.usage_bytes,
             "disk_quota_blocked": quota.blocked,
@@ -279,6 +280,19 @@ def refresh_user_quota_for_admin(user_id: int, admin=Depends(get_current_admin),
     return _quota_response(_find_quota_user(user_id, db), db, refresh=True)
 
 
+@router.put("/users/{user_id}/gpu-quota")
+def update_user_gpu_quota(user_id: int, req: object = Body(default=None), admin=Depends(get_current_admin), db=Depends(get_db)):
+    if not isinstance(req, dict) or set(req) != {"max_gpus_per_user"}:
+        raise HTTPException(status_code=400, detail="请指定 max_gpus_per_user")
+    limit = req["max_gpus_per_user"]
+    if type(limit) is not int or not 0 <= limit <= 2**31 - 1:
+        raise HTTPException(status_code=400, detail="GPU 配额必须是非负整数且不能超过数据库支持范围")
+    user = _find_quota_user(user_id, db)
+    user.max_gpus_per_user = limit
+    db.commit()
+    return {"id": user.id, "max_gpus_per_user": user.max_gpus_per_user}
+
+
 @router.get("/users/pending", response_model=list)
 def list_pending_users(admin=Depends(get_current_admin), db=Depends(get_db)):
     users = db.query(UserModel).filter(UserModel.role == "user", UserModel.approved == 0).all()
@@ -338,6 +352,7 @@ def delete_user(user_id: int, admin=Depends(get_current_admin), db=Depends(get_d
         db.query(LeaseRecordModel).filter(LeaseRecordModel.container_id == c.id).delete(synchronize_session=False)
         db.delete(c)
 
+    db.query(UserNotificationModel).filter(UserNotificationModel.user_id == user_id).delete(synchronize_session=False)
     db.delete(u)
     db.commit()
     return {"message": "用户及其关联资源已成功删除"}

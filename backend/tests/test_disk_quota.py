@@ -1,12 +1,21 @@
 from datetime import datetime, timedelta
-from pathlib import Path
 from types import SimpleNamespace
 
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
 from sqlalchemy import Column, Integer, MetaData, String, Table, create_engine, inspect, text
+from sqlalchemy.orm import Session
+from sqlalchemy.pool import StaticPool
+
+from app.api import containers as containers_api
+from app.auth import create_access_token
+from app.container_lifecycle import RemovalResult, remove_container_record
+from app.database import Base, get_db
+from app.database_models import ContainerModel, UserModel, UserNotificationModel
 
 from app import quota_service
 from app.database import _migrate_container_stop_reason, _migrate_disk_quota
-from app.scheduler import _enforce_disk_quotas, _remove_stopped_containers, _stop_disk_quota_containers
+from app.scheduler import _enforce_disk_quotas, _mark_stopped_if_running, _remove_stopped_containers, _stop_disk_quota_containers, _stop_expired_containers
 from app.quota_service import QuotaStatus
 
 
@@ -15,6 +24,10 @@ class FakeDb:
         self.rows = rows or []
         self.commits = 0
         self.closed = False
+        self.events = []
+
+    def add(self, event):
+        self.events.append(event)
 
     def query(self, model):
         return FakeQuery(self.rows)
@@ -287,6 +300,39 @@ def test_disk_quota_stop_marks_all_running_containers(monkeypatch):
     assert db.commits == 2
 
 
+def test_worker_scheduler_expiry_and_cleanup_hold_gpu_lock(monkeypatch):
+    from app import scheduler
+
+    class Lock:
+        held = False
+
+        def __enter__(self):
+            assert not self.held
+            self.held = True
+
+        def __exit__(self, *args):
+            self.held = False
+
+    lock = Lock()
+    monkeypatch.setattr(scheduler, "NODE_ROLE", "worker")
+    monkeypatch.setattr(scheduler, "worker_gpu_lock", lock)
+    now = datetime.now()
+    container = SimpleNamespace(id=1, name="expired", node_id=scheduler.NODE_ID, container_id="docker-one",
+                                status="running", expires_at=now - timedelta(hours=1), gpu_ids="0",
+                                pending_share_json=None, stop_reason=None, stopped_at=None,
+                                gpu_idle_low_since=None, gpu_idle_last_sample_at=None)
+    db = FakeDb([container])
+    monkeypatch.setattr(scheduler, "SessionLocal", FakeSessionFactory(db))
+    monkeypatch.setattr(scheduler, "stop_container", lambda _: lock.held)
+    monkeypatch.setattr(scheduler, "_send_notify", lambda *_: None)
+    _stop_expired_containers()
+    assert container.status == "stopped"
+    container.stopped_at = now - timedelta(hours=25)
+    monkeypatch.setattr(scheduler, "remove_container_record", lambda *args: SimpleNamespace(success=lock.held, error=None))
+    _remove_stopped_containers()
+    assert not lock.held
+
+
 def test_generic_cleanup_handles_disk_quota_containers(monkeypatch):
     container = SimpleNamespace(
         name="quota-stopped",
@@ -299,10 +345,127 @@ def test_generic_cleanup_handles_disk_quota_containers(monkeypatch):
     removed = []
     monkeypatch.setattr(
         "app.scheduler.remove_container_record",
-        lambda *args: removed.append(args) or SimpleNamespace(success=True, error=None),
+        lambda *args, **kwargs: removed.append((args, kwargs)) or SimpleNamespace(success=True, error=None),
     )
 
     _remove_stopped_containers()
 
     assert len(removed) == 1
+    assert removed[0][1]["notification_type"] == "disk_quota_destroyed"
     assert db.closed
+
+
+def test_disk_events_only_on_complete_committed_band_crossings(monkeypatch):
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    with Session(engine) as db:
+        user = UserModel(username="alice", hashed_password="x", role="user", disk_quota_bytes=100)
+        admin = UserModel(username="boss", hashed_password="x", role="admin", disk_quota_bytes=100)
+        db.add_all([user, admin])
+        db.commit()
+        for usage in (100, 100, 95, 89, 100):
+            quota_service.refresh_user_quota(db, user, usage_bytes=usage)
+        assert [e.type for e in db.query(UserNotificationModel).order_by(UserNotificationModel.id)] == [
+            "disk_usage_90", "disk_usage_100", "disk_usage_90", "disk_usage_100",
+        ]
+        monkeypatch.setattr(quota_service, "workspace_usage_for_user_result", lambda _: quota_service.WorkspaceUsage(0, False))
+        quota_service.refresh_user_quota(db, user)
+        assert user.disk_notification_band == 100
+        quota_service.refresh_user_quota(db, admin, usage_bytes=1000)
+        assert db.query(UserNotificationModel).count() == 4
+        quota_service.refresh_user_quota(db, user, usage_bytes=0, commit=False)
+        db.rollback()
+        assert db.get(UserModel, user.id).disk_notification_band == 100
+        assert db.query(UserNotificationModel).count() == 4
+    engine.dispose()
+
+
+def test_uncommitted_quota_crossings_commit_or_rollback_together():
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    with Session(engine) as db:
+        user = UserModel(username="alice", hashed_password="x", role="user", disk_quota_bytes=100)
+        db.add(user)
+        db.commit()
+        user_id = user.id
+
+        quota_service.refresh_user_quota(db, user, usage_bytes=100, commit=False)
+        assert user.disk_notification_band == 100
+        db.rollback()
+        assert db.get(UserModel, user_id).disk_notification_band == 0
+        assert db.query(UserNotificationModel).count() == 0
+
+        quota_service.refresh_user_quota(db, user, usage_bytes=100, commit=False)
+        db.commit()
+        db.expire_all()
+        assert db.get(UserModel, user_id).disk_notification_band == 100
+        assert [event.type for event in db.query(UserNotificationModel).order_by(UserNotificationModel.id)] == [
+            "disk_usage_90", "disk_usage_100",
+        ]
+    engine.dispose()
+
+
+def test_disk_stop_and_destroy_are_distinct_and_retry_safe():
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    with Session(engine) as db:
+        user = UserModel(username="alice", hashed_password="x")
+        db.add(user)
+        db.commit()
+        now = datetime.now()
+        container = ContainerModel(name="disk-box", user_id=user.id, container_id="docker-id", ssh_port=20002,
+                                   expires_at=now + timedelta(days=1), status="running")
+        db.add(container)
+        db.commit()
+        assert _mark_stopped_if_running(db, container.id, "disk_quota", now)
+        assert _mark_stopped_if_running(db, container.id, "disk_quota", now) is None
+        assert remove_container_record(db, container, "cleanup", docker_remover=lambda _: RemovalResult(success=False),
+                                       notification_type="disk_quota_destroyed").success is False
+        assert [e.type for e in db.query(UserNotificationModel).all()] == ["disk_quota_stopped"]
+        assert remove_container_record(db, container, "cleanup", docker_remover=lambda _: RemovalResult(success=True),
+                                       notification_type="disk_quota_destroyed").success
+        assert remove_container_record(db, container, "cleanup", notification_type="disk_quota_destroyed").already_removed
+        assert [e.type for e in db.query(UserNotificationModel).order_by(UserNotificationModel.id)] == [
+            "disk_quota_stopped", "disk_quota_destroyed",
+        ]
+    engine.dispose()
+
+
+def test_notification_security_read_state_and_lifecycle():
+    engine = create_engine("sqlite:///:memory:", connect_args={"check_same_thread": False}, poolclass=StaticPool)
+    Base.metadata.create_all(engine)
+    with Session(engine) as db:
+        alice = UserModel(username="alice", hashed_password="x", role="user")
+        bob = UserModel(username="bob", hashed_password="x", role="user")
+        db.add_all([alice, bob])
+        db.commit()
+        now = datetime.now()
+        container = ContainerModel(name="original", user_id=alice.id, container_id="docker-id", ssh_port=20001,
+                                   expires_at=now + timedelta(days=1), status="running", gpu_ids="0")
+        db.add(container)
+        db.commit()
+        failed = remove_container_record(db, container, "idle", docker_remover=lambda _: RemovalResult(success=False),
+                                         notification_type="gpu_idle_reclaimed")
+        assert not failed.success
+        assert db.query(UserNotificationModel).count() == 0
+        succeeded = remove_container_record(db, container, "idle", docker_remover=lambda _: RemovalResult(success=True),
+                                            notification_type="gpu_idle_reclaimed")
+        assert succeeded.success
+        assert remove_container_record(db, container, "idle", notification_type="gpu_idle_reclaimed").already_removed
+        event = db.query(UserNotificationModel).one()
+        assert event.container_name == "original"
+        app = FastAPI()
+        app.include_router(containers_api.router, prefix="/api/containers")
+        app.dependency_overrides[get_db] = lambda: db
+        alice_headers = {"Authorization": f"Bearer {create_access_token({'sub': 'alice'})}"}
+        bob_headers = {"Authorization": f"Bearer {create_access_token({'sub': 'bob'})}"}
+        with TestClient(app) as client:
+            path = f"/api/containers/notifications/{event.id}/read"
+            assert client.get("/api/containers/notifications").status_code in (401, 403)
+            assert client.get("/api/containers/notifications", headers=bob_headers).json()["items"] == []
+            assert client.post(path, headers=bob_headers).status_code == 404
+            assert client.get("/api/containers/notifications", headers=alice_headers).json()["unread_count"] == 1
+            assert client.post(path, headers=alice_headers).status_code == 200
+            assert client.post(path, headers=alice_headers).status_code == 200
+            assert client.get("/api/containers/notifications", headers=alice_headers).json()["unread_count"] == 0
+    engine.dispose()

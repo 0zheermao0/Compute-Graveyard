@@ -41,8 +41,8 @@ def get_used_ssh_ports() -> set:
                     for b in binds:
                         if b.get("HostPort"):
                             used.add(int(b["HostPort"]))
-    except DockerException:
-        pass
+    except DockerException as exc:
+        raise RuntimeError("读取 Docker 端口占用失败") from exc
     return used
 
 
@@ -66,8 +66,8 @@ def get_used_host_ports() -> set:
                     for b in binds:
                         if b.get("HostPort"):
                             used.add(int(b["HostPort"]))
-    except DockerException:
-        pass
+    except DockerException as exc:
+        raise RuntimeError("读取 Docker 端口占用失败") from exc
     return used
 
 
@@ -108,16 +108,19 @@ def create_container(
     gpu_ids: List[int],
     ssh_port: int,
     mem_limit_gb: int = 8,
+    workspace_path: Optional[str] = None,
+    ssh_password: Optional[str] = None,
+    request_id: Optional[str] = None,
+    extra_ports_map: Optional[Dict[int, int]] = None,
 ) -> tuple[Optional[str], Optional[str], Dict[int, int]]:
     """
     创建容器（GPU 或纯 CPU），随机 SSH 密码，常用端口随机映射。
     返回 (container_id, ssh_password, extra_ports {容器端口: 宿主机端口})
     """
-    ensure_user_dir(username)
-    user_workspace = os.path.join(USER_DATA_BASE, username)
-    ssh_password = secrets.token_urlsafe(12)
+    user_workspace = workspace_path if workspace_path is not None else ensure_user_dir(username)
+    ssh_password = ssh_password if ssh_password is not None else secrets.token_urlsafe(12)
 
-    extra_ports_map = allocate_service_ports()
+    extra_ports_map = extra_ports_map if extra_ports_map is not None else allocate_service_ports()
     if not extra_ports_map:
         raise RuntimeError("暂无可用服务端口，请稍后重试")
 
@@ -158,6 +161,7 @@ def create_container(
                 "compute-graveyard.managed": "true",
                 "compute-graveyard.username": username,
                 "compute-graveyard.gpu_ids": ",".join(map(str, sorted(gpu_ids))),
+                **({"compute-graveyard.request_id": request_id} if request_id else {}),
             },
             mem_limit=f"{mem_limit_gb}g",
             shm_size="32g",
@@ -229,7 +233,7 @@ def rollback_gpu_merge(container_id: str, name: str, username: str, old_gpu_ids:
         replacement.remove()
 
 
-def merge_container_gpus(container_id: str, name: str, username: str, old_gpu_ids: list[int], gpu_ids: list[int], ssh_port: int, extra_ports: dict, ssh_password_hash: str, mem_limit_gb: int) -> str:
+def merge_container_gpus(container_id: str, name: str, username: str, old_gpu_ids: list[int], gpu_ids: list[int], ssh_port: int, extra_ports: dict, ssh_password_hash: str, mem_limit_gb: int, workspace_path: Optional[str] = None) -> str:
     client = get_docker_client()
     old = client.containers.get(container_id)
     _merge_identity(old, name, username, old_gpu_ids)
@@ -238,7 +242,7 @@ def merge_container_gpus(container_id: str, name: str, username: str, old_gpu_id
     config = old.attrs.get("Config") or {}
     host = old.attrs.get("HostConfig") or {}
     mounts = old.attrs.get("Mounts") or []
-    workspace = os.path.join(USER_DATA_BASE, username)
+    workspace = workspace_path if workspace_path is not None else os.path.join(USER_DATA_BASE, username)
     if not any(m.get("Destination") == "/workspace" and m.get("Source") == workspace and m.get("RW") for m in mounts):
         raise RuntimeError("目标工作区挂载不匹配")
     if any(m.get("Destination") not in {"/workspace", "/datasets"} or m.get("Type") != "bind" for m in mounts):
@@ -371,7 +375,7 @@ def remove_container(container_id: str) -> bool:
         return False
 
 
-def list_managed_containers() -> List[Dict[str, Any]]:
+def list_managed_containers(include_request_id: bool = False) -> List[Dict[str, Any]]:
     try:
         client = get_docker_client()
         rows = []
@@ -395,6 +399,7 @@ def list_managed_containers() -> List[Dict[str, Any]]:
                 "status": "merging" if container.name.endswith("-merge-old") else container.status,
                 "username": labels.get("compute-graveyard.username", ""),
                 "gpu_ids": labels.get("compute-graveyard.gpu_ids", ""),
+                **({"request_id": labels.get("compute-graveyard.request_id")} if include_request_id else {}),
                 "ssh_port": ssh_port,
                 "extra_ports": extra_ports,
             })

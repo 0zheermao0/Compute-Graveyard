@@ -1,6 +1,7 @@
 import { useRef } from "react";
 import { motion, useAnimationFrame } from "motion/react";
 import { User, Clock, Activity, Zap, Thermometer } from "lucide-react";
+import type { GpuSharingStatus } from "../pages/Dashboard";
 import "./GPUTwin.css";
 
 export interface GPUInfo {
@@ -31,31 +32,35 @@ interface TwinGPUData {
   model: string;
   utilization: number;
   power: number;
-  user: string;
-  contact?: string;
+  occupants: { name: string; contact: string; uptime: string }[];
   isOccupied: boolean;
-  uptime: string;
+  isUnknownOccupancy: boolean;
   temp: number;
   memoryPercent: number;
 }
 
-function buildTwinData(gpus: GPUInfo[], occupancies: Occupancy[]): TwinGPUData[] {
+function buildTwinData(gpus: GPUInfo[], occupancies: Occupancy[], gpuSharing: GpuSharingStatus[]): TwinGPUData[] {
   return gpus.map((gpu) => {
-    const occ = occupancies.find((o) => o.gpu_index === gpu.index);
+    const known = occupancies.filter((o) => o.gpu_index === gpu.index);
+    const sharing = gpuSharing.find((row) => row.gpu_index === gpu.index);
+    const isUnknownOccupancy = Boolean(sharing && (sharing.unknown_occupant_count !== undefined
+      ? sharing.unknown_occupant_count > 0
+      : sharing.occupant_count > known.length || (!known.length && sharing.external_occupied)));
+    const occupants = known.map((occ) => ({
+      name: occ.real_name || occ.display_name || occ.username,
+      contact: occ.contact_value ? `(${occ.contact_type === "wechat" ? "微信" : "手机"}: ${occ.contact_value})` : "",
+      uptime: occ.duration_hours != null ? `${occ.duration_hours}h` : "-",
+    }));
     const util = gpu.utilization ?? gpu.memory_percent ?? 0;
     const power = Math.round((util / 100) * 350);
-    const contactInfo = occ?.contact_value
-      ? `(${occ.contact_type === "wechat" ? "微信" : "手机"}: ${occ.contact_value})`
-      : "";
     return {
       id: gpu.index,
       model: gpu.name,
       utilization: Math.min(100, util),
       power,
-      user: occ ? occ.real_name || occ.display_name || occ.username : "空闲",
-      contact: contactInfo,
-      isOccupied: !!occ,
-      uptime: occ?.duration_hours != null ? `${occ.duration_hours}h` : "-",
+      occupants,
+      isOccupied: Boolean(known.length || isUnknownOccupancy),
+      isUnknownOccupancy,
       temp: gpu.temperature ?? 0,
       memoryPercent: gpu.memory_percent ?? 0,
     };
@@ -173,7 +178,7 @@ const InfoCard = ({ data }: { data: TwinGPUData }) => {
   const isActive = data.isOccupied;
   const isCritical = data.temp > 80;
   const statusClass = isCritical ? "critical" : isActive ? "active" : "idle";
-  const statusText = isCritical ? "高温" : isActive ? "占用" : "空闲";
+  const statusText = isCritical ? "高温" : data.isUnknownOccupancy ? "占用者未知" : isActive ? "占用" : "空闲";
 
   return (
     <div className="twin-card glass-card">
@@ -185,16 +190,26 @@ const InfoCard = ({ data }: { data: TwinGPUData }) => {
         </div>
         <div className={`twin-card-badge ${statusClass}`}>{statusText}</div>
       </div>
-      <div className="twin-card-row">
-        <span><User size={12} /> 用户</span>
-        <span title={data.user + " " + (data.contact || "")}>
-          {data.user} <small style={{ opacity: 0.7, fontSize: '0.7rem' }}>{data.contact}</small>
-        </span>
-      </div>
-      <div className="twin-card-row">
-        <span><Clock size={12} /> 时长</span>
-        <span>{data.uptime}</span>
-      </div>
+      {data.occupants.map((occupant, index) => (
+        <div key={index}>
+          <div className="twin-card-row">
+            <span><User size={12} /> 用户</span>
+            <span style={{ maxWidth: "none", whiteSpace: "normal", overflowWrap: "anywhere", textAlign: "right" }}>
+              {occupant.name} <small style={{ opacity: 0.7, fontSize: '0.7rem' }}>{occupant.contact}</small>
+            </span>
+          </div>
+          <div className="twin-card-row">
+            <span><Clock size={12} /> 时长</span>
+            <span>{occupant.uptime}</span>
+          </div>
+        </div>
+      ))}
+      {(data.isUnknownOccupancy || !data.occupants.length) && (
+        <div className="twin-card-row">
+          <span><User size={12} /> 用户</span>
+          <span>{data.isUnknownOccupancy ? "占用者信息不可用" : "空闲"}</span>
+        </div>
+      )}
       <div className="twin-card-bar-wrap">
         <div className="twin-card-bar-label">
           <span><Activity size={12} /> 利用率</span>
@@ -235,11 +250,13 @@ const InfoCard = ({ data }: { data: TwinGPUData }) => {
 export default function GPUTwin({
   gpus,
   occupancies,
+  gpuSharing = [],
 }: {
   gpus: GPUInfo[];
   occupancies: Occupancy[];
+  gpuSharing?: GpuSharingStatus[];
 }) {
-  const list = buildTwinData(gpus, occupancies);
+  const list = buildTwinData(gpus, occupancies, gpuSharing);
 
   if (!gpus.length) {
     return (

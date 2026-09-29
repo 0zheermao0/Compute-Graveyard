@@ -54,6 +54,7 @@ NODE_SERVICE_SCHEME = os.getenv("NODE_SERVICE_SCHEME", "http").strip().lower()
 if NODE_SERVICE_SCHEME not in {"http", "https"}:
     raise ValueError("NODE_SERVICE_SCHEME must be http or https")
 AGENT_API_TOKEN = os.getenv("AGENT_API_TOKEN", "").strip()
+MASTER_API_URL = os.getenv("MASTER_API_URL", "").strip()
 AGENT_REQUEST_TIMEOUT_SECONDS = float(os.getenv("AGENT_REQUEST_TIMEOUT_SECONDS", "10"))
 if AGENT_REQUEST_TIMEOUT_SECONDS <= 0:
     raise ValueError("AGENT_REQUEST_TIMEOUT_SECONDS must be positive")

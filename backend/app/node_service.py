@@ -1,11 +1,10 @@
 import ipaddress
-import json
 import re
 from datetime import datetime
 from urllib.parse import urlsplit
 
 from app.config import NODE_ID, NODE_NAME, NODE_PUBLIC_HOST, NODE_ROLE, NODE_SERVICE_SCHEME
-from app.database_models import ComputeNodeModel, ContainerModel
+from app.database_models import ComputeNodeModel, ContainerModel, UserModel
 from app.docker_service import allocate_ssh_port, create_container, get_gpu_info, get_system_load, list_managed_containers, remove_container, stop_container
 from app.remote_agent import RemoteAgentClient, RemoteAgentError
 
@@ -45,40 +44,55 @@ def build_service_url(scheme: str, host: str, port: int) -> str:
     return f"{normalized_scheme}://{normalize_public_host(host, required=True)}:{int(port)}"
 
 
-def local_inventory(db) -> dict:
-    containers = db.query(ContainerModel).filter(
-        ContainerModel.node_id == NODE_ID,
-        ContainerModel.status.in_(["running", "merging", "stopped"]),
+def active_owners(db, node_id: str) -> list[dict]:
+    rows = db.query(ContainerModel, UserModel).join(UserModel, ContainerModel.user_id == UserModel.id).filter(
+        ContainerModel.node_id == node_id,
+        ContainerModel.status == "running",
+        ContainerModel.container_id.isnot(None),
     ).all()
-    database_containers = []
-    for row in containers:
-        try:
-            extra_ports = json.loads(row.extra_ports) if row.extra_ports else {}
-        except (TypeError, json.JSONDecodeError):
-            extra_ports = {}
-        database_containers.append({
-            "container_id": row.container_id,
-            "name": row.name,
-            "status": row.status,
-            "gpu_ids": row.gpu_ids or "",
-            "ssh_port": row.ssh_port,
-            "extra_ports": extra_ports,
-        })
-    try:
-        managed = list_managed_containers()
-    except RuntimeError:
-        managed = []
-    known_ids = {row["container_id"] for row in database_containers if row["container_id"]}
-    database_containers.extend(row for row in managed if row["container_id"] not in known_ids)
+    return [
+        {
+            "container_id": container.container_id,
+            "container_name": container.name,
+            "gpu_ids": container.gpu_ids or "",
+            "ssh_port": container.ssh_port,
+            "created_at": container.created_at.isoformat() if container.created_at else None,
+            "expires_at": container.expires_at.isoformat(),
+            "username": user.username,
+            "display_name": user.display_name or user.username,
+            "real_name": user.real_name or None,
+            "contact_type": user.contact_type or None,
+            "contact_value": user.contact_value or None,
+        }
+        for container, user in rows
+    ]
+
+
+def verified_owners(db, node_id: str, runtime: list[dict]) -> list[dict]:
+    running = {row.get("container_id"): row for row in runtime if row.get("container_id") and row.get("status") == "running" and not str(row.get("name") or "").endswith("-merge-old")}
+    return [
+        {**owner, "gpu_ids": running[owner["container_id"]].get("gpu_ids") or ""}
+        for owner in active_owners(db, node_id)
+        if owner["container_id"] in running
+        and running[owner["container_id"]].get("name") == owner["container_name"]
+        and running[owner["container_id"]].get("username") == owner["username"]
+    ]
+
+
+def local_inventory(db) -> dict:
+    managed = list_managed_containers()
+    gpus = get_gpu_info()
+    containers = managed
     return {
         "node_id": NODE_ID,
         "node_name": NODE_NAME,
         "public_host": NODE_PUBLIC_HOST,
         "service_scheme": NODE_SERVICE_SCHEME,
         "role": NODE_ROLE,
-        "gpus": get_gpu_info(),
+        "gpus": gpus,
         "system_load": get_system_load(),
-        "containers": database_containers,
+        "containers": containers,
+        "owners": verified_owners(db, NODE_ID, managed),
     }
 
 
@@ -116,12 +130,15 @@ def inventory_for_node(db, node: ComputeNodeModel) -> dict:
     return inventory
 
 
-def aggregate_inventories(db, enabled_only: bool = True) -> list[dict]:
+def aggregate_inventories(db, enabled_only: bool = True, local_only: bool = False) -> list[dict]:
     query = db.query(ComputeNodeModel)
     if enabled_only:
         query = query.filter(ComputeNodeModel.enabled.is_(True))
     result = []
     for node in query.order_by(ComputeNodeModel.id).all():
+        if local_only and node.id != NODE_ID:
+            result.append({"node": node_response(node), "online": False, "inventory": None, "error": None})
+            continue
         try:
             inventory = inventory_for_node(db, node)
             result.append({"node": node_response(node), "online": True, "inventory": inventory, "error": None})
@@ -130,20 +147,45 @@ def aggregate_inventories(db, enabled_only: bool = True) -> list[dict]:
     return result
 
 
-def _users_per_gpu(db, node_id: str) -> dict[int, set[int]]:
+def _users_per_gpu(db, node_id: str, inventory: dict | None = None) -> dict[int, set[int]]:
     result: dict[int, set[int]] = {}
-    rows = db.query(ContainerModel).filter(ContainerModel.node_id == node_id, ContainerModel.status.in_(["running", "merging"])).all()
+    if inventory is None:
+        rows = db.query(ContainerModel).filter(ContainerModel.node_id == node_id, ContainerModel.status.in_(["running", "merging"])).all()
+        runtime = {row.container_id: {"gpu_ids": row.gpu_ids} for row in rows}
+    else:
+        runtime = {row.get("container_id"): row for row in inventory.get("containers", []) if row.get("container_id")}
+        known = _known_runtime_ids(db, node_id, inventory)
+        if not known:
+            return result
+        rows = db.query(ContainerModel).filter(ContainerModel.node_id == node_id, ContainerModel.container_id.in_(known)).all()
     for row in rows:
-        for value in str(row.gpu_ids or "").split(","):
+        for value in str(runtime[row.container_id].get("gpu_ids") or "").split(","):
             if value.strip():
                 result.setdefault(int(value), set()).add(row.user_id)
     return result
 
 
-def _inventory_occupied_gpu_ids(inventory: dict) -> set[int]:
+def _known_runtime_ids(db, node_id: str, inventory: dict) -> set[str]:
+    runtime = {row.get("container_id"): row for row in inventory.get("containers", []) if row.get("container_id")}
+    if not runtime:
+        return set()
+    rows = db.query(ContainerModel, UserModel).join(UserModel, ContainerModel.user_id == UserModel.id).filter(
+        ContainerModel.node_id == node_id,
+        ContainerModel.status.in_(["running", "merging"]),
+        ContainerModel.container_id.in_(runtime),
+    ).all()
+    return {container.container_id for container, user in rows if runtime[container.container_id].get("status") == "running"
+            and not str(runtime[container.container_id].get("name") or "").endswith("-merge-old")
+            and runtime[container.container_id].get("name") == container.name
+            and runtime[container.container_id].get("username") == user.username}
+
+
+def _inventory_occupied_gpu_ids(inventory: dict, known_container_ids: set[str] | None = None) -> set[int]:
+    known_container_ids = known_container_ids or set()
     return {
         int(value)
         for row in inventory.get("containers", [])
+        if row.get("container_id") not in known_container_ids or str(row.get("name") or "").endswith("-merge-old")
         if row.get("status") in {"running", "merging"} or str(row.get("name") or "").endswith("-merge-old")
         for value in str(row.get("gpu_ids") or "").split(",")
         if value.strip()
@@ -162,6 +204,45 @@ def _has_capacity(gpu_ids: list[int], users_per_gpu: dict[int, set[int]], applic
     return True
 
 
+def worker_share_snapshot(db, node_id: str, inventory: dict, gpu_ids: list[int]) -> list[dict]:
+    want = set(gpu_ids)
+    owners = inventory.get("owners")
+    if not isinstance(owners, list):
+        raise ValueError("Worker 未提供可验证的占用者信息")
+    master_ids = {row.container_id for row in db.query(ContainerModel).filter(
+        ContainerModel.node_id == node_id, ContainerModel.status.in_(["running", "merging"])).all()}
+    if any(want & {int(part) for part in str(row.gpu_ids or "").split(",") if part}
+           for row in db.query(ContainerModel).filter(ContainerModel.node_id == node_id,
+           ContainerModel.status.in_(["running", "merging"])).all()):
+        raise ValueError("所选 GPU 混有 Master 占用")
+    snapshot = []
+    seen = set()
+    for item in inventory["containers"]:
+        try:
+            occupied = {int(part) for part in str(item.get("gpu_ids") or "").split(",") if part}
+        except (TypeError, ValueError) as exc:
+            raise ValueError("Worker GPU 占用信息无效") from exc
+        if not occupied & want or item.get("status") not in ("running", "merging") and not str(item.get("name") or "").endswith("-merge-old"):
+            continue
+        cid = item.get("container_id")
+        matching = [owner for owner in owners if isinstance(owner, dict) and owner.get("container_id") == cid]
+        if (not cid or cid in seen or cid in master_ids or len(matching) != 1 or item.get("status") != "running"
+                or str(item.get("name") or "").endswith("-merge-old")):
+            raise ValueError("所选 GPU 存在未知或 Master 占用")
+        owner = matching[0]
+        if (owner.get("container_name") != item.get("name") or owner.get("username") != item.get("username")
+                or owner.get("gpu_ids") != item.get("gpu_ids")):
+            raise ValueError("Worker 占用者信息不一致")
+        try:
+            if datetime.fromisoformat(owner["expires_at"]) <= datetime.now():
+                raise ValueError("Worker 占用者已过期")
+        except (KeyError, TypeError) as exc:
+            raise ValueError("Worker 占用者有效期无效") from exc
+        seen.add(cid)
+        snapshot.append({"container_id": cid, "name": item["name"], "username": item["username"], "gpu_ids": sorted(occupied)})
+    return sorted(snapshot, key=lambda row: row["container_id"])
+
+
 def select_node(
     db,
     placement_mode: str,
@@ -170,6 +251,7 @@ def select_node(
     cpu_only: bool,
     applicant_id: int | None = None,
     max_share: int | None = None,
+    allow_worker_share: bool = False,
 ) -> tuple[ComputeNodeModel, dict]:
     if placement_mode not in {"local", "specific", "auto"}:
         raise ValueError("placement_mode 必须是 local、specific 或 auto")
@@ -186,11 +268,13 @@ def select_node(
             available_ids = {int(row["index"]) for row in inventory.get("gpus", [])}
             if not set(gpu_ids).issubset(available_ids):
                 raise ValueError("指定节点不包含所选 GPU")
-            if node.id != NODE_ID:
-                known = {row.container_id for row in db.query(ContainerModel).filter(ContainerModel.node_id == node.id, ContainerModel.status.in_(["running", "merging"])).all()}
-                if any(row.get("status") == "running" and row.get("container_id") not in known and set(gpu_ids) & {int(x) for x in str(row.get("gpu_ids") or "").split(",") if x} for row in inventory.get("containers", [])):
-                    raise ValueError("指定节点的所选 GPU 存在未知占用")
-            if applicant_id is not None and max_share is not None and not _has_capacity(gpu_ids, _users_per_gpu(db, node.id), applicant_id, max_share):
+            known = _known_runtime_ids(db, node.id, inventory)
+            worker_share = allow_worker_share and node.id != NODE_ID and bool(set(gpu_ids) & _inventory_occupied_gpu_ids(inventory, known))
+            if worker_share:
+                worker_share_snapshot(db, node.id, inventory, gpu_ids)
+            elif set(gpu_ids) & _inventory_occupied_gpu_ids(inventory, known):
+                raise ValueError("指定节点的所选 GPU 存在未知占用")
+            if not worker_share and applicant_id is not None and max_share is not None and not _has_capacity(gpu_ids, _users_per_gpu(db, node.id, inventory), applicant_id, max_share):
                 raise ValueError("所选 GPU 已达到共用人数上限")
         return node, inventory
 
@@ -216,12 +300,12 @@ def select_node(
             available_ids = {int(row["index"]) for row in inventory.get("gpus", [])}
             if not set(gpu_ids).issubset(available_ids):
                 continue
-            occupied_ids = _inventory_occupied_gpu_ids(inventory)
-            if node.id != NODE_ID and set(gpu_ids) & occupied_ids:
+            known = _known_runtime_ids(db, node.id, inventory)
+            if node.id != NODE_ID and set(gpu_ids) & _inventory_occupied_gpu_ids(inventory):
                 continue
-            if node.id == NODE_ID and (applicant_id is None or max_share is None) and set(gpu_ids) & occupied_ids:
+            if node.id == NODE_ID and set(gpu_ids) & _inventory_occupied_gpu_ids(inventory, known if applicant_id is not None and max_share is not None else None):
                 continue
-            users_per_gpu = _users_per_gpu(db, node.id) if applicant_id is not None and max_share is not None else {}
+            users_per_gpu = _users_per_gpu(db, node.id, inventory) if applicant_id is not None and max_share is not None else {}
             if not _has_capacity(gpu_ids, users_per_gpu, applicant_id, max_share):
                 continue
             gpu_by_id = {int(row["index"]): row for row in inventory.get("gpus", [])}

@@ -6,6 +6,9 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from threading import RLock
 from typing import Optional
+from uuid import uuid4
+
+from app.database_models import UserNotificationModel
 
 from app.config import DEFAULT_DISK_QUOTA_BYTES, DISK_QUOTA_GRACE_HOURS, USER_DATA_BASE
 
@@ -220,6 +223,18 @@ def _refresh_user_quota(
             )
         else:
             measured_usage = measurement.usage_bytes
+            band = 100 if measured_usage >= quota_bytes else 90 if measured_usage * 10 >= quota_bytes * 9 else 0
+            previous_band = getattr(user, "disk_notification_band", 0) or 0
+            if getattr(user, "id", None) is not None:
+                for threshold in (90, 100):
+                    if previous_band < threshold <= band:
+                        db.add(UserNotificationModel(
+                            user_id=user.id, event_key=f"disk-{threshold}-{uuid4().hex}",
+                            type=f"disk_usage_{threshold}", title=f"工作区磁盘使用量达到 {threshold}%",
+                            message=f"当前工作区已使用 {measured_usage} 字节，配额为 {quota_bytes} 字节。",
+                            created_at=now,
+                        ))
+                user.disk_notification_band = band
             over_quota = measured_usage >= quota_bytes
             exceeded_since = _exceeded_since_value(user) if over_quota else None
             if over_quota and exceeded_since is None:

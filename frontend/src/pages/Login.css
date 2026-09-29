@@ -96,3 +96,19 @@
 .login-register a:hover {
   color: var(--sky);
 }
+
+@media (max-width: 768px) {
+  .login-page {
+    min-height: 100dvh;
+    padding: 1rem;
+  }
+
+  .login-card {
+    padding: clamp(1.1rem, 5vw, 2rem);
+    max-width: 440px;
+  }
+
+  .login-card h1 {
+    font-size: clamp(1.35rem, 5vw, 1.75rem);
+  }
+}

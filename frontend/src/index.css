@@ -15,7 +15,7 @@
   --sky-soft: #74c0fc;
   --amber: #ffc107;
   --amber-soft: #ffda6a;
-  
+
   /* 背景与玻璃 */
   --bg-gradient: linear-gradient(135deg, #667eea 0%, #764ba2 25%, #f093fb 50%, #f5576c 75%, #ff9a9e 100%);
   --bg-base: #050505;
@@ -23,25 +23,25 @@
   --glass-bg-strong: rgba(255, 255, 255, 0.15);
   --glass-border: rgba(255, 255, 255, 0.2);
   --glass-border-light: rgba(255, 255, 255, 0.1);
-  
+
   --text: #f8f9fa;
   --text-secondary: #ced4da;
   --text-muted: #adb5bd;
-  
+
   --accent: var(--sky-soft);
   --success: var(--mint);
   --warning: var(--amber);
   --danger: var(--coral);
-  
+
   --font-display: 'Nunito', system-ui, sans-serif;
   --font-mono: 'JetBrains Mono', monospace;
-  
+
   --radius-sm: 10px;
   --radius-md: 14px;
   --radius-lg: 20px;
   --radius-xl: 24px;
   --radius-full: 9999px;
-  
+
   /* 兼容旧变量 */
   --bg-dark: var(--bg-base);
   --bg-card: var(--glass-bg);
@@ -303,4 +303,38 @@ option {
 .btn-copy:hover {
   background: rgba(255, 255, 255, 0.12);
   border-color: rgba(255, 255, 255, 0.2);
+}
+
+#root, .layout, .main-wrap, .main {
+  min-width: 0;
+}
+
+button, input, select, textarea {
+  font: inherit;
+}
+
+button, .btn, select {
+  touch-action: manipulation;
+}
+
+:where(button, a, input, select, textarea):focus-visible {
+  outline: 2px solid #34d399;
+  outline-offset: 2px;
+}
+
+:where(.main, .modal, .glass-card) {
+  overflow-wrap: anywhere;
+}
+
+@media (max-width: 768px) {
+  .btn, .btn-sm, .btn-small, .btn-copy {
+    min-height: 40px;
+    white-space: normal;
+  }
+
+  input, select, textarea {
+    max-width: 100%;
+    min-width: 0;
+    font-size: 16px;
+  }
 }

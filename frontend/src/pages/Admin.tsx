@@ -13,6 +13,7 @@ interface User {
   role: string;
   created_at: string;
   disk_quota_bytes: number;
+  max_gpus_per_user: number;
   disk_usage_bytes: number;
   disk_quota_blocked: boolean;
   disk_quota_exceeded_since?: string | null;
@@ -211,8 +212,11 @@ export default function Admin() {
   const [loading, setLoading] = useState(false);
   const [createError, setCreateError] = useState("");
   const [quotaDrafts, setQuotaDrafts] = useState<Record<number, string>>({});
+  const [gpuQuotaDrafts, setGpuQuotaDrafts] = useState<Record<number, string>>({});
   const [quotaSaving, setQuotaSaving] = useState<number | null>(null);
+  const [gpuQuotaSaving, setGpuQuotaSaving] = useState<number | null>(null);
   const [quotaRefreshing, setQuotaRefreshing] = useState<number | null>(null);
+  const [isMaster, setIsMaster] = useState(false);
   const [nodes, setNodes] = useState<ComputeNode[]>([]);
   const [nodeInventories, setNodeInventories] = useState<Record<string, NodeInventoryResult>>({});
   const [nodeDraft, setNodeDraft] = useState<NodeDraft>(emptyNodeDraft);
@@ -247,6 +251,10 @@ export default function Admin() {
     setUsers(data);
     setQuotaDrafts(data.reduce<Record<number, string>>((drafts, user) => {
       drafts[user.id] = (user.disk_quota_bytes / GIB).toString();
+      return drafts;
+    }, {}));
+    setGpuQuotaDrafts(data.reduce<Record<number, string>>((drafts, user) => {
+      drafts[user.id] = user.max_gpus_per_user.toString();
       return drafts;
     }, {}));
   };
@@ -292,8 +300,18 @@ export default function Admin() {
     loadUsers();
     loadPendingUsers();
     loadContainers();
-    loadNodes().catch((e) => pushToast(e instanceof Error ? e.message : "节点加载失败", "error"));
+    let active = true;
+    fetcher<{ role: string }>("/health").then((health) => {
+      if (!active || health.role !== "master") return;
+      setIsMaster(true);
+      loadNodes().catch((e) => {
+        if (active) pushToast(e instanceof Error ? e.message : "节点加载失败", "error");
+      });
+    }).catch(() => {
+      if (active) setIsMaster(false);
+    });
     loadSettings();
+    return () => { active = false; };
   }, []);
 
   const handleSaveNode = async (e: React.FormEvent) => {
@@ -472,6 +490,28 @@ export default function Admin() {
     }
   };
 
+  const handleSaveGpuQuota = async (userId: number) => {
+    const value = gpuQuotaDrafts[userId];
+    const limit = Number(value);
+    if (value === undefined || value.trim() === "" || !Number.isSafeInteger(limit) || limit < 0 || limit > 2147483647) {
+      pushToast("GPU 配额必须是非负整数", "error");
+      return;
+    }
+    setGpuQuotaSaving(userId);
+    try {
+      await fetcher(`/admin/users/${userId}/gpu-quota`, {
+        method: "PUT",
+        body: JSON.stringify({ max_gpus_per_user: limit }),
+      });
+      await loadUsers();
+      pushToast("GPU 配额已更新", "success");
+    } catch (e) {
+      pushToast(e instanceof Error ? e.message : "GPU 配额更新失败", "error");
+    } finally {
+      setGpuQuotaSaving(null);
+    }
+  };
+
   const handleRefreshQuota = async (userId: number) => {
     setQuotaRefreshing(userId);
     try {
@@ -513,7 +553,7 @@ export default function Admin() {
       <ConfirmDialog state={confirm} onCancel={closeConfirm} />
       <h1>管理后台</h1>
 
-      <section className="admin-section">
+      {isMaster && <section className="admin-section">
         <h2>计算节点管理</h2>
         <form onSubmit={handleSaveNode} className="node-form">
           <input
@@ -593,7 +633,7 @@ export default function Admin() {
             })}
           </div>
         )}
-      </section>
+      </section>}
 
       {/* 资源配额设置 */}
       <section className="admin-section">
@@ -758,7 +798,7 @@ export default function Admin() {
         {pendingUsers.length === 0 ? (
           <p className="admin-empty">暂无待审批用户</p>
         ) : (
-          <table className="admin-table">
+          <div className="admin-table-wrap"><table className="admin-table">
             <thead>
               <tr>
                 <th>用户名</th>
@@ -781,14 +821,14 @@ export default function Admin() {
                 </tr>
               ))}
             </tbody>
-          </table>
+          </table></div>
         )}
       </section>
 
       {/* 用户列表 */}
       <section className="admin-section">
         <h2>用户列表</h2>
-        <table className="admin-table">
+        <div className="admin-table-wrap"><table className="admin-table">
           <thead>
             <tr>
               <th>ID</th>
@@ -798,6 +838,7 @@ export default function Admin() {
               <th>审批状态</th>
               <th>磁盘使用</th>
               <th>磁盘配额</th>
+              <th>GPU 配额</th>
               <th>配额状态</th>
               <th>角色</th>
               <th>操作</th>
@@ -852,6 +893,27 @@ export default function Admin() {
                   )}
                 </td>
                 <td>
+                  <div className="quota-editor">
+                    <input
+                      type="number"
+                      min="0"
+                      max="2147483647"
+                      step="1"
+                      value={gpuQuotaDrafts[u.id] ?? ""}
+                      onChange={(e) => setGpuQuotaDrafts((drafts) => ({ ...drafts, [u.id]: e.target.value }))}
+                    />
+                    <span>块</span>
+                    <button
+                      type="button"
+                      className="btn btn-small"
+                      onClick={() => handleSaveGpuQuota(u.id)}
+                      disabled={gpuQuotaSaving === u.id}
+                    >
+                      {gpuQuotaSaving === u.id ? "保存中" : "保存"}
+                    </button>
+                  </div>
+                </td>
+                <td>
                   <span className={`quota-status ${u.disk_quota_blocked ? "blocked" : "normal"}`}>
                     {u.quota_exempt ? "管理员豁免" : !u.scan_complete ? "检测失败，已暂停申请" : u.disk_quota_blocked ? "已禁止申请" : "正常"}
                   </span>
@@ -877,13 +939,13 @@ export default function Admin() {
               </tr>
             ))}
           </tbody>
-        </table>
+        </table></div>
       </section>
 
       {/* 所有容器 */}
       <section className="admin-section">
         <h2>全部容器</h2>
-        <table className="admin-table">
+        <div className="admin-table-wrap"><table className="admin-table">
           <thead>
             <tr>
               <th>名称</th>
@@ -930,7 +992,7 @@ export default function Admin() {
               </tr>
             ))}
           </tbody>
-        </table>
+        </table></div>
       </section>
     </div>
   );

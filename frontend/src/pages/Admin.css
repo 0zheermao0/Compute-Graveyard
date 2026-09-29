@@ -675,3 +675,98 @@
   padding-top: 0.75rem;
   border-top: 1px solid var(--glass-border-light);
 }
+
+.admin-table-wrap {
+  max-width: 100%;
+  overflow-x: auto;
+  border-radius: var(--radius-lg);
+  -webkit-overflow-scrolling: touch;
+}
+
+.admin-table-wrap .admin-table {
+  min-width: max-content;
+}
+
+.admin-table-wrap .notifications-table {
+  min-width: 620px;
+  width: 100%;
+}
+
+.notifications-table td:nth-child(3) {
+  white-space: normal;
+  min-width: 220px;
+  max-width: 460px;
+  overflow-wrap: anywhere;
+}
+
+.admin-page .modal-overlay {
+  overflow-y: auto;
+  align-items: safe center;
+}
+
+.admin-page .modal-overlay .modal {
+  max-height: calc(100dvh - 2rem);
+  overflow-y: auto;
+}
+
+.admin-table-wrap td, .admin-table-wrap th {
+  white-space: nowrap;
+}
+
+.admin-table-wrap td code {
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+
+.admin-table-wrap .quota-editor {
+  min-width: 0;
+}
+
+.admin-table-wrap .quota-usage-cell {
+  min-width: 150px;
+}
+
+.admin-form input {
+  min-width: 0;
+  flex: 1 1 180px;
+}
+
+@media (max-width: 768px) {
+  .admin-page h1 {
+    font-size: 1.4rem;
+    margin-bottom: 1.25rem;
+  }
+
+  .admin-section {
+    margin-bottom: 1.75rem;
+  }
+
+  .admin-settings-grid, .node-form, .node-grid {
+    grid-template-columns: minmax(0, 1fr);
+    padding: 0.9rem;
+  }
+
+  .admin-form .btn-primary {
+    flex: 1 1 100%;
+  }
+
+  .node-form-actions, .node-card-header > div {
+    flex-wrap: wrap;
+  }
+
+  .node-card {
+    min-width: 0;
+  }
+
+  .node-resource-summary {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .node-resource-summary span, .node-gpu-list span {
+    overflow-wrap: anywhere;
+  }
+
+  .setting-input-wrap input {
+    min-width: 0;
+  }
+}

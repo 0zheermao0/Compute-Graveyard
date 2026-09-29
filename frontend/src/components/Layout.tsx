@@ -36,6 +36,7 @@ export default function Layout() {
   const [sloganIndex, setSloganIndex] = useState(0);
   const [showInstructions, setShowInstructions] = useState(false);
   const [unreadCount, setUnreadCount] = useState(0);
+  const [menuOpen, setMenuOpen] = useState(false);
 
   useEffect(() => {
     const t = setInterval(() => setSloganIndex((i) => (i + 1) % SLOGANS.length), 10000);
@@ -139,49 +140,30 @@ export default function Layout() {
       {/* 移动端顶栏 */}
       <div className="layout-mobile-header">
         <div className="layout-mobile-header-top">
-          <Link to="/" className="sidebar-logo">
+          <Link to="/" className="sidebar-logo" onClick={() => setMenuOpen(false)}>
             {BRAND_EN} · {BRAND_ZH}
           </Link>
-          <span className="layout-mobile-username">
-            {user?.display_name || user?.username}
-          </span>
-        </div>
-        <p className="header-slogan header-slogan-mobile">{SLOGANS[sloganIndex]}</p>
-        <nav className="layout-mobile-nav">
-          {navItems.map((item) => (
-            <Link
-              key={item.to}
-              to={item.to}
-              className={loc.pathname === item.to ? "active" : ""}
-            >
-              {item.label}
-            </Link>
-          ))}
-        </nav>
-        <a
-          href="https://github.com/YuhangPei/Compute-Graveyard"
-          target="_blank"
-          rel="noopener noreferrer"
-          className="btn btn-ghost"
-          style={{ padding: "0.35rem", display: "flex", alignItems: "center", marginRight: "0.5rem" }}
-          title="GitHub 源码"
-        >
-          <img src="/github_icon.svg" alt="GitHub" style={{ width: "20px", height: "20px" }} />
-        </a>
-        <button
-          className="btn btn-ghost"
-          style={{ padding: "0.35rem 0.6rem", fontSize: "0.85rem", marginRight: "1rem" }}
-          onClick={() => setShowInstructions(true)}
-        >
-          说明
-        </button>
-        <div className="layout-mobile-actions">
-          <Link to="/notifications" className="btn btn-ghost" style={{ padding: "0.35rem 0.6rem", fontSize: "0.85rem", marginRight: "0.5rem" }}>
-            通知{unreadCount > 0 ? `(${unreadCount > 99 ? "99+" : unreadCount})` : ""}
+          <Link to="/notifications" className="header-bell" onClick={() => setMenuOpen(false)} aria-label={`通知${unreadCount ? `，${unreadCount} 条未读` : ""}`}>
+            <Bell size={18} />
+            {unreadCount > 0 && <span className="header-bell-badge">{unreadCount > 99 ? "99+" : unreadCount}</span>}
           </Link>
-          <button onClick={handleLogout} className="btn btn-ghost" style={{ padding: "0.35rem 0.6rem", fontSize: "0.85rem" }}>
-            退出
+          <button type="button" className="btn btn-ghost layout-menu-toggle" aria-expanded={menuOpen} aria-controls="mobile-menu" onClick={() => setMenuOpen(!menuOpen)}>
+            {menuOpen ? "关闭" : "菜单"}
           </button>
+        </div>
+        <div id="mobile-menu" className={`layout-mobile-menu${menuOpen ? " open" : ""}`}>
+          <nav className="layout-mobile-nav" aria-label="主导航">
+            {navItems.map((item) => (
+              <Link key={item.to} to={item.to} className={loc.pathname === item.to ? "active" : ""} onClick={() => setMenuOpen(false)}>
+                {item.label}
+              </Link>
+            ))}
+          </nav>
+          <div className="layout-mobile-actions">
+            <button type="button" className="btn btn-ghost" onClick={() => { setShowInstructions(true); setMenuOpen(false); }}>使用说明</button>
+            <a href="https://github.com/YuhangPei/Compute-Graveyard" target="_blank" rel="noopener noreferrer" className="btn btn-ghost">GitHub 源码</a>
+            <button onClick={handleLogout} className="btn btn-ghost">退出登录</button>
+          </div>
         </div>
       </div>
 

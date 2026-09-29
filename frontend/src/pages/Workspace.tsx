@@ -376,7 +376,7 @@ export default function Workspace() {
             </div>
             <div className="modal-body modal-body-editor">
               <Editor
-                height="60vh"
+                height="min(55dvh, 560px)"
                 language={editPath ? getLanguage(editPath) : "plaintext"}
                 value={editContent}
                 onChange={(v) => setEditContent(v ?? "")}

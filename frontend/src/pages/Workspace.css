@@ -328,3 +328,63 @@
   transform: translateY(-2px);
   box-shadow: 0 4px 12px rgba(0, 0, 0, 0.2);
 }
+
+.workspace-table-wrap {
+  max-width: 100%;
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+}
+
+.workspace-table {
+  min-width: 560px;
+}
+
+.workspace-breadcrumb {
+  overflow-wrap: anywhere;
+}
+
+.modal-overlay .modal-editor {
+  width: min(100%, 1000px);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.modal-editor .modal-body {
+  min-height: 0;
+  overflow: auto;
+}
+
+@media (max-width: 768px) {
+  .workspace-header {
+    flex-wrap: wrap;
+    gap: 0.75rem;
+  }
+
+  .workspace-toolbar {
+    width: 100%;
+    flex-wrap: wrap;
+  }
+
+  .workspace-toolbar .btn {
+    flex: 1 1 auto;
+  }
+
+  .workspace-quota-header {
+    align-items: flex-start;
+    flex-wrap: wrap;
+  }
+
+  .modal-overlay .modal-editor {
+    width: 100%;
+  }
+
+  .modal-editor .modal-body {
+    padding: 0.5rem;
+  }
+
+  .container-select-list .btn-block {
+    white-space: normal;
+    overflow-wrap: anywhere;
+  }
+}

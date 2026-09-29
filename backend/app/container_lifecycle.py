@@ -5,7 +5,7 @@ from typing import Callable, Optional
 
 from docker.errors import DockerException, NotFound
 
-from app.database_models import ContainerModel
+from app.database_models import ContainerModel, UserNotificationModel
 from app.docker_service import get_docker_client
 
 
@@ -59,6 +59,7 @@ def remove_container_record(
     expected_container_id: Optional[str] = None,
     expected_gpu_ids: Optional[str] = None,
     expected_low_since: Optional[datetime] = None,
+    notification_type: Optional[str] = None,
 ) -> RemovalResult:
     has_expectations = any(
         value is not None
@@ -104,5 +105,13 @@ def remove_container_record(
     container.gpu_idle_low_since = None
     container.gpu_idle_last_sample_at = None
     container.pending_share_json = None
+    if notification_type:
+        db.add(UserNotificationModel(
+            user_id=container.user_id, event_key=f"{notification_type}-{container.id}",
+            type=notification_type,
+            title="容器因磁盘配额被销毁" if notification_type == "disk_quota_destroyed" else "GPU 低利用容器已回收",
+            message=f"容器 {original_name} 已自动销毁，工作区保留。",
+            container_id=container.id, container_name=original_name, created_at=removed_at,
+        ))
     db.commit()
     return result

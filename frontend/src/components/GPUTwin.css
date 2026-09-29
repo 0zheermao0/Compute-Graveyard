@@ -508,3 +508,47 @@
   border: 2px dashed var(--glass-border);
   border-radius: var(--radius-lg);
 }
+
+.twin-grid {
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 34rem), 1fr));
+  gap: 1rem 3.5rem;
+  padding: 1rem 1rem 1rem 3.5rem;
+}
+
+.twin-row {
+  min-width: 0;
+}
+
+.twin-card {
+  flex: 1;
+  min-width: 0;
+}
+
+.twin-card-header > div:first-child {
+  min-width: 0;
+}
+
+.twin-card-model {
+  overflow-wrap: anywhere;
+}
+
+@media (max-width: 900px) {
+  .twin-grid {
+    grid-template-columns: minmax(0, 1fr);
+    padding: 0.5rem;
+    gap: 0.75rem;
+  }
+
+  .twin-row .twin-gpu-visual, .twin-row .twin-conn {
+    display: none;
+  }
+
+  .twin-card {
+    width: 100%;
+  }
+
+  .twin-title {
+    font-size: 1.2rem;
+    flex-wrap: wrap;
+  }
+}

@@ -9,7 +9,7 @@ from app.database import get_db
 from app.database_models import UserModel
 from app.models import UserResponse, Token, UserRegister, UserProfileUpdate, UserPasswordChange
 from app.auth import verify_password, create_access_token, get_current_user, get_password_hash
-from app.config import DEFAULT_DISK_QUOTA_BYTES, INITIAL_ADMIN_PASSWORD, INITIAL_ADMIN_USERNAME, INIT_ADMIN_TOKEN
+from app.config import DEFAULT_DISK_QUOTA_BYTES, INITIAL_ADMIN_PASSWORD, INITIAL_ADMIN_USERNAME, INIT_ADMIN_TOKEN, NODE_ROLE
 
 router = APIRouter()
 bootstrap_security = HTTPBearer(auto_error=False)
@@ -85,7 +85,9 @@ def init_admin(
 def register(req: UserRegister, db=Depends(get_db)):
     """用户自助注册，需管理员审批后才能登录使用"""
     username = req.username.strip().lower()
-    if not USERNAME_PINYIN_RE.match(username):
+    if NODE_ROLE == "worker" and username == ".compute-graveyard-master":
+        raise HTTPException(status_code=400, detail="用户名已保留")
+    if not USERNAME_PINYIN_RE.fullmatch(username):
         raise HTTPException(
             status_code=400,
             detail="用户名请使用名字全拼（小写字母，如 zhangsan、ouyang-xiao）",
