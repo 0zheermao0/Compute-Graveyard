@@ -3,6 +3,7 @@ pydantic>=2.5,<3
 uvicorn[standard]==0.27.0
 sqlalchemy==2.0.25
 python-jose[cryptography]==3.3.0
+webauthn==2.7.0
 passlib==1.7.4
 docker>=7.1.0
 requests<2.32.0

@@ -97,6 +97,39 @@
   color: var(--sky);
 }
 
+.login-submit {
+  width: 100%;
+}
+
+.login-submit:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+  transform: none;
+}
+
+.login-divider {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  margin: 1.1rem 0;
+  color: var(--text-muted);
+  font-size: 0.8rem;
+}
+
+.login-divider::before,
+.login-divider::after {
+  content: '';
+  flex: 1;
+  height: 1px;
+  background: var(--glass-border-light);
+}
+
+.login-passkey-hint {
+  margin: 0.65rem 0;
+  color: var(--text-muted);
+  font-size: 0.8rem;
+}
+
 @media (max-width: 768px) {
   .login-page {
     min-height: 100dvh;

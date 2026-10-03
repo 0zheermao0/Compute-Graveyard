@@ -8,7 +8,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
-from app.api import agent, auth, dashboard, containers, admin, leases, workspace, personal
+from app.api import agent, auth, dashboard, containers, admin, leases, workspace, personal, passkeys
 from app.config import CORS_ORIGINS, NODE_ROLE
 from app.database import create_default_admin, init_db
 
@@ -24,6 +24,7 @@ if CORS_ORIGINS:
     )
 
 app.include_router(auth.router, prefix="/api/auth", tags=["认证"])
+app.include_router(passkeys.router, prefix="/api/auth/passkeys", tags=["Passkey"])
 app.include_router(personal.router, prefix="/api/personal", tags=["个人 API"])
 app.include_router(dashboard.router, prefix="/api/dashboard", tags=["看板"])
 app.include_router(containers.router, prefix="/api/containers", tags=["容器"])

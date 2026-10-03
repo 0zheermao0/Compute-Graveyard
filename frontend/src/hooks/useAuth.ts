@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback } from "react";
+import { authenticatePasskey } from "../api/passkeys";
 
 const API = "/api";
 
@@ -11,6 +12,12 @@ export interface User {
   real_name?: string | null;
   contact_type?: string | null;
   contact_value?: string | null;
+}
+
+export interface LoginToken {
+  access_token: string;
+  token_type: string;
+  user: User;
 }
 
 export function useAuth() {
@@ -46,6 +53,18 @@ export function useAuth() {
     fetchUser();
   }, [fetchUser]);
 
+  const completeLogin = (data: LoginToken) => {
+    localStorage.setItem("token", data.access_token);
+    setUser(data.user);
+    return data.user;
+  };
+
+  const loginWithPasskey = async (signal?: AbortSignal) => {
+    const data = await authenticatePasskey(signal);
+    if (signal?.aborted) throw new DOMException("Passkey operation aborted", "AbortError");
+    return completeLogin(data);
+  };
+
   const login = async (username: string, password: string) => {
     const res = await fetch(`${API}/auth/login`, {
       method: "POST",
@@ -56,10 +75,8 @@ export function useAuth() {
       const err = await res.json().catch(() => ({}));
       throw new Error(err.detail || "登录失败");
     }
-    const data = await res.json();
-    localStorage.setItem("token", data.access_token);
-    setUser(data.user);
-    return data.user;
+    const data: LoginToken = await res.json();
+    return completeLogin(data);
   };
 
   const logout = () => {
@@ -67,5 +84,5 @@ export function useAuth() {
     setUser(null);
   };
 
-  return { user, loading, login, logout, refresh: fetchUser };
+  return { user, loading, login, loginWithPasskey, logout, refresh: fetchUser };
 }

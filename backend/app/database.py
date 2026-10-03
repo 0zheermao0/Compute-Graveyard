@@ -5,7 +5,7 @@ from pathlib import Path
 from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.orm import sessionmaker, declarative_base
-from sqlalchemy.pool import StaticPool
+from sqlalchemy.pool import NullPool
 
 from app.config import (
     DATABASE_URL,
@@ -27,11 +27,19 @@ if "sqlite" in _db_url:
     Path(DATA_DIR).mkdir(parents=True, exist_ok=True)
     _db_url = f"sqlite:///{_db_path}"
 
-engine = create_engine(
-    _db_url,
-    connect_args={"check_same_thread": False} if "sqlite" in DATABASE_URL else {},
-    poolclass=StaticPool if "sqlite" in DATABASE_URL else None,
-)
+def _create_database_engine(url: str):
+    is_sqlite = url.startswith("sqlite")
+    # 文件 SQLite 每个 Session 使用独立连接，避免 StaticPool 的跨请求事务回滚。
+    # NullPool 也避免有界连接池的等待者占满 FastAPI 线程池，阻止持有连接的
+    # 请求执行后续步骤并释放连接。SQLite 连接轻量，关闭 Session 即关闭连接。
+    return create_engine(
+        url,
+        connect_args={"check_same_thread": False} if is_sqlite else {},
+        poolclass=NullPool if is_sqlite else None,
+    )
+
+
+engine = _create_database_engine(_db_url)
 
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
@@ -55,6 +63,33 @@ def init_db():
     _migrate_container_stop_reason()
     _migrate_compute_nodes()
     _migrate_container_merge()
+    _migrate_passkeys()
+    _migrate_reputation()
+
+
+def _migrate_reputation(bind=None):
+    from app.database_models import ReputationEventModel
+    bind = bind or engine
+    _add_missing_columns(bind, "users", {"reputation_score": "INTEGER NOT NULL DEFAULT 0"})
+    ReputationEventModel.__table__.create(bind, checkfirst=True)
+    _add_missing_columns(bind, "reputation_events", {
+        "reason": "TEXT NOT NULL DEFAULT ''",
+        "source": "VARCHAR(64) NOT NULL DEFAULT 'custom'",
+    })
+
+
+def _migrate_passkeys(bind=None):
+    """保留历史账号，旧用户首次绑定时原子生成随机 WebAuthn handle。"""
+    from app.database_models import PasskeyModel, PasskeyChallengeModel, UserModel
+
+    if bind is None:
+        bind = engine
+    _add_missing_columns(bind, "users", {"webauthn_user_handle": "VARCHAR(64)"})
+    if inspect(bind).has_table("users"):
+        handle_index = next(index for index in UserModel.__table__.indexes if index.name == "ix_users_webauthn_user_handle")
+        handle_index.create(bind, checkfirst=True)
+    PasskeyModel.__table__.create(bind, checkfirst=True)
+    PasskeyChallengeModel.__table__.create(bind, checkfirst=True)
 
 
 def _migrate_container_merge(bind=None):
@@ -244,6 +279,10 @@ def _idle_reclaim_column_types(dialect_name: str) -> dict[str, str]:
     return {
         "gpu_idle_low_since": timestamp_type,
         "gpu_idle_last_sample_at": timestamp_type,
+        "gpu_idle_stage_mask": "INTEGER NOT NULL DEFAULT 0",
+        "gpu_idle_warned_at": timestamp_type,
+        "gpu_idle_memory_snapshot": "TEXT",
+        "gpu_idle_cards_json": "TEXT",
         "removal_reason": "VARCHAR(256)",
         "removed_at": timestamp_type,
     }
@@ -317,7 +356,9 @@ def create_default_admin():
     try:
         admin = db.query(UserModel).filter(UserModel.role == "admin").first()
         if not admin and db.query(UserModel).count() == 0 and INITIAL_ADMIN_PASSWORD:
+            from app.settings_service import load_settings
             admin = UserModel(
+                reputation_score=load_settings(db).reputation_initial_score,
                 username=INITIAL_ADMIN_USERNAME,
                 hashed_password=get_password_hash(INITIAL_ADMIN_PASSWORD),
                 role="admin",

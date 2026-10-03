@@ -13,8 +13,9 @@ from app.database_models import UserModel, ContainerModel, LeaseRecordModel, Com
 from app.models import UserCreate, UserResponse
 from app.auth import get_password_hash
 from app.container_lifecycle import merge_cleanup_pending, remove_container_record
+from app.share_lifecycle import reject_shares_for_exit, synchronized_occupancy_exit
 from app.settings_service import SettingsValues, load_settings, save_settings
-from app.config import DEFAULT_DISK_QUOTA_BYTES, NODE_ID, NODE_ROLE
+from app.config import DEFAULT_DISK_QUOTA_BYTES, MAX_REPUTATION_SCORE, NODE_ID, NODE_ROLE
 from app.node_service import aggregate_inventories, inventory_for_node, node_response, normalize_public_host, stop_on_node
 from app.remote_agent import RemoteAgentClient, RemoteAgentError, normalize_agent_base_url
 from app.quota_service import quota_status, quota_status_payload, refresh_user_quota
@@ -162,6 +163,7 @@ def create_user(req: UserCreate, admin=Depends(get_current_admin), db=Depends(ge
     if db.query(UserModel).filter(UserModel.username == username).first():
         raise HTTPException(status_code=400, detail="用户名已存在")
     user = UserModel(
+        reputation_score=load_settings(db).reputation_initial_score,
         username=username,
         hashed_password=get_password_hash(req.password),
         display_name=req.display_name or req.username,
@@ -192,6 +194,7 @@ def list_users(admin=Depends(get_current_admin), db=Depends(get_db)):
             "role": u.role,
             "created_at": u.created_at,
             "max_gpus_per_user": u.max_gpus_per_user,
+            "reputation_score": u.reputation_score,
             "disk_quota_bytes": quota.quota_bytes,
             "disk_usage_bytes": quota.usage_bytes,
             "disk_quota_blocked": quota.blocked,
@@ -362,6 +365,8 @@ def delete_user(user_id: int, admin=Depends(get_current_admin), db=Depends(get_d
         db.query(LeaseRecordModel).filter(LeaseRecordModel.container_id == c.id).delete(synchronize_session=False)
         db.delete(c)
 
+    from app.database_models import ReputationEventModel
+    db.query(ReputationEventModel).filter(ReputationEventModel.user_id == user_id).delete(synchronize_session=False)
     db.query(UserNotificationModel).filter(UserNotificationModel.user_id == user_id).delete(synchronize_session=False)
     db.delete(u)
     db.commit()
@@ -369,6 +374,7 @@ def delete_user(user_id: int, admin=Depends(get_current_admin), db=Depends(get_d
 
 
 @router.post("/containers/{container_id}/force-stop")
+@synchronized_occupancy_exit
 def force_stop(container_id: int, admin=Depends(get_current_admin), db=Depends(get_db)):
     c = db.query(ContainerModel).filter(ContainerModel.id == container_id).first()
     if not c:
@@ -380,6 +386,7 @@ def force_stop(container_id: int, admin=Depends(get_current_admin), db=Depends(g
         c.stop_reason = "admin"
         from datetime import datetime
         c.stopped_at = datetime.now()
+        reject_shares_for_exit(db, c, now=c.stopped_at)
         db.commit()
         return {"message": "已强制停止"}
     raise HTTPException(status_code=500, detail="停止失败")
@@ -434,6 +441,38 @@ def get_settings(admin=Depends(get_current_admin), db=Depends(get_db)):
         raise HTTPException(status_code=500, detail=f"系统设置无效: {exc}") from exc
 
 
+from pydantic import StrictInt
+
+
+class ReputationScoreUpdate(BaseModel):
+    reputation_score: StrictInt
+
+
+@router.put("/users/{user_id}/reputation-score")
+def update_reputation_score(user_id: int, req: ReputationScoreUpdate, admin=Depends(get_current_admin), db=Depends(get_db)):
+    from uuid import uuid4
+    from app.reputation_service import record_event
+    if not 0 <= req.reputation_score <= MAX_REPUTATION_SCORE:
+        raise HTTPException(status_code=400, detail=f"分数必须为 0~{MAX_REPUTATION_SCORE} 的整数")
+    if not db.get(UserModel, user_id):
+        raise HTTPException(status_code=404, detail="用户不存在")
+    event = record_event(db, user_id, f"admin-{uuid4().hex}", "admin_set", score=req.reputation_score,
+                         actor_id=admin.id, source="admin",
+                         reason="管理员清零信誉分" if req.reputation_score == 0 else "管理员手动设置信誉分")
+    db.commit()
+    return {"user_id": user_id, "reputation_score": event.score_after, "event_id": event.id}
+
+
+@router.get("/users/{user_id}/reputation-events")
+def reputation_events(user_id: int, admin=Depends(get_current_admin), db=Depends(get_db)):
+    from app.database_models import ReputationEventModel
+    if not db.get(UserModel, user_id):
+        raise HTTPException(status_code=404, detail="用户不存在")
+    return [{key: getattr(event, key) for key in ("id", "user_id", "event_key", "event_type", "delta",
+             "score_before", "score_after", "actor_id", "container_id", "created_at", "source", "reason")}
+            for event in db.query(ReputationEventModel).filter_by(user_id=user_id).order_by(ReputationEventModel.id.desc()).all()]
+
+
 class SettingsUpdate(BaseModel):
     cpu_mem_gb: int
     gpu_mem_gb_per_gpu: int
@@ -442,6 +481,18 @@ class SettingsUpdate(BaseModel):
     idle_gpu_util_threshold_percent: int
     idle_gpu_memory_threshold_percent: int
     idle_gpu_duration_hours: int
+    idle_gpu_dual_low_enabled: bool = True
+    idle_gpu_memory_unchanged_enabled: bool = True
+    idle_gpu_shrink_enabled: bool = True
+    reputation_initial_score: StrictInt = 0
+    reputation_idle_warning_points: StrictInt = 1
+    reputation_idle_reclaim_points: StrictInt = 2
+    reputation_idle_shrink_points: StrictInt = 2
+    reputation_expiry_reward_points: StrictInt = 2
+    reputation_tier1_threshold: StrictInt = 5
+    reputation_tier1_max_days: StrictInt = 5
+    reputation_tier2_threshold: StrictInt = 10
+    reputation_tier2_max_days: StrictInt = 3
 
 
 def _model_values(model: BaseModel) -> dict:
@@ -452,8 +503,15 @@ def _model_values(model: BaseModel) -> dict:
 
 @router.put("/settings")
 def update_settings(req: SettingsUpdate, admin=Depends(get_current_admin), db=Depends(get_db)):
-    values = SettingsValues(**_model_values(req))
+    from dataclasses import asdict
+    supplied = req.model_fields_set if hasattr(req, "model_fields_set") else req.__fields_set__
+    updates = _model_values(req)
     try:
+        stored = asdict(load_settings(db))
+        for key in list(updates):
+            if key.startswith("reputation_") and key not in supplied:
+                updates[key] = stored[key]
+        values = SettingsValues(**updates)
         return save_settings(db, values)
     except ValueError as exc:
         db.rollback()

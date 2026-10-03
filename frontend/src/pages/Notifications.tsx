@@ -4,7 +4,7 @@ import { fetcher } from "../api/client";
 import "./MyContainers.css";
 import "./Admin.css";
 
-type NotificationType = "share_approval_request" | "remote_share_approval_request" | "lease_renew_reminder_1d" | "share_waiting_for_others" | "disk_usage_90" | "disk_usage_100" | "disk_quota_stopped" | "disk_quota_destroyed" | "gpu_idle_reclaimed";
+type NotificationType = "share_approval_request" | "remote_share_approval_request" | "lease_renew_reminder_1d" | "share_waiting_for_others" | "disk_usage_90" | "disk_usage_100" | "disk_quota_stopped" | "disk_quota_destroyed" | "gpu_idle_warning" | "gpu_idle_reclaimed" | "gpu_idle_shrink_warning" | "gpu_idle_shrunk";
 
 interface NotificationItem {
   id: string;
@@ -53,6 +53,9 @@ export default function Notifications() {
       if (item.type === "share_approval_request" || item.type === "remote_share_approval_request") return { ...item, category: "审批", priority: 1 };
        if (item.type === "lease_renew_reminder_1d") return { ...item, category: "续租", priority: 2 };
        if (item.type.startsWith("disk_")) return { ...item, category: "磁盘", priority: 2 };
+       if (item.type === "gpu_idle_shrink_warning") return { ...item, category: "缩卡预警", priority: 2 };
+       if (item.type === "gpu_idle_shrunk") return { ...item, category: "自动缩卡", priority: 2 };
+       if (item.type === "gpu_idle_warning") return { ...item, category: "回收预警", priority: 2 };
        if (item.type === "gpu_idle_reclaimed") return { ...item, category: "回收", priority: 2 };
        return { ...item, category: "进度", priority: 3 };
     }).sort((a, b) => {

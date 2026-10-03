@@ -387,6 +387,35 @@
   grid-column: 1 / -1;
 }
 
+.idle-reclaim-conditions {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr) auto minmax(0, 1fr);
+  align-items: end;
+  gap: 1rem;
+}
+
+.idle-reclaim-conditions .setting-input-wrap input {
+  width: 100%;
+  min-width: 0;
+}
+
+.idle-condition-and {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 2.5rem;
+  color: var(--text-muted);
+  font-size: 1.25rem;
+  font-weight: 700;
+}
+
+@media (max-width: 640px) {
+  .idle-reclaim-conditions {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 0.5rem;
+  }
+}
+
 .setting-group-title {
   margin-top: 0.5rem;
   padding-top: 1.25rem;

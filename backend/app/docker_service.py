@@ -233,11 +233,12 @@ def rollback_gpu_merge(container_id: str, name: str, username: str, old_gpu_ids:
         replacement.remove()
 
 
-def merge_container_gpus(container_id: str, name: str, username: str, old_gpu_ids: list[int], gpu_ids: list[int], ssh_port: int, extra_ports: dict, ssh_password_hash: str, mem_limit_gb: int, workspace_path: Optional[str] = None) -> str:
+def merge_container_gpus(container_id: str, name: str, username: str, old_gpu_ids: list[int], gpu_ids: list[int], ssh_port: int, extra_ports: dict, ssh_password_hash: str, mem_limit_gb: int, workspace_path: Optional[str] = None, shrink: bool = False) -> str:
     client = get_docker_client()
     old = client.containers.get(container_id)
     _merge_identity(old, name, username, old_gpu_ids)
-    if old.status != "running" or not ssh_password_hash or not set(old_gpu_ids).issubset(gpu_ids) or len(gpu_ids) <= len(old_gpu_ids):
+    valid_change = (bool(gpu_ids) and set(gpu_ids) < set(old_gpu_ids)) if shrink else (set(old_gpu_ids) < set(gpu_ids))
+    if old.status != "running" or not ssh_password_hash or not valid_change:
         raise RuntimeError("目标容器状态或 GPU 参数已变化")
     config = old.attrs.get("Config") or {}
     host = old.attrs.get("HostConfig") or {}
@@ -282,8 +283,8 @@ def merge_container_gpus(container_id: str, name: str, username: str, old_gpu_id
             image.id, name=new_name, detach=True,
             device_requests=[docker.types.DeviceRequest(driver="nvidia", device_ids=[str(i) for i in sorted(gpu_ids)], capabilities=[["gpu"]])],
             ports=expected, volumes=volumes, environment=env, labels=labels,
-            mem_limit=max(int(host.get("Memory") or 0), mem_limit_gb * 1024 ** 3),
-            memswap_limit=max(int(host.get("MemorySwap") or 0), mem_limit_gb * 2 * 1024 ** 3) if int(host.get("MemorySwap") or 0) != -1 else -1,
+            mem_limit=int(host.get("Memory") or 0) if shrink else max(int(host.get("Memory") or 0), mem_limit_gb * 1024 ** 3),
+            memswap_limit=int(host.get("MemorySwap") or 0) if shrink else (max(int(host.get("MemorySwap") or 0), mem_limit_gb * 2 * 1024 ** 3) if int(host.get("MemorySwap") or 0) != -1 else -1),
             shm_size=int(host.get("ShmSize") or 0) or "32g",
             working_dir=config.get("WorkingDir") or None, user=config.get("User") or None,
             command=config.get("Cmd") or None, entrypoint=config.get("Entrypoint") or None,

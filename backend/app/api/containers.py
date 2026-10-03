@@ -53,6 +53,14 @@ def _synchronized_share_action(func):
     return wrapper
 
 
+from app.reputation_service import enforce_lease, gpu_max_lease_days
+
+
+@router.get("/application-policy")
+def application_policy(user=Depends(get_current_user), db=Depends(get_db)):
+    return {"gpu_max_lease_days": gpu_max_lease_days(db, user), "cpu_max_lease_days": MAX_LEASE_DAYS}
+
+
 def _max_gpu_sharing(db) -> int:
     v = int(get_setting("max_gpu_sharing_users", str(DEFAULT_MAX_GPU_SHARING_USERS)))
     return max(1, v)
@@ -137,7 +145,9 @@ def _finish_remote_share(db, c, payload, node, result):
     c.extra_ports = json.dumps(provisioned["extra_ports"])
     c.access_host = node.public_host or provisioned.get("public_host")
     c.service_scheme = provisioned.get("service_scheme") if provisioned.get("service_scheme") in ("http", "https") else "http"
-    c.expires_at = datetime.now() + timedelta(days=payload["lease_days"])
+    user = db.get(UserModel, c.user_id)
+    allowed_days = min(payload["lease_days"], gpu_max_lease_days(db, user))
+    c.expires_at = datetime.now() + timedelta(days=allowed_days)
     c.pending_share_json = None
     c.status = "running"
     db.commit()
@@ -222,6 +232,10 @@ def _reconcile_remote_shares(db, user_id):
                 continue
             inventory = inventory_for_node(db, node)
             if worker_share_snapshot(db, node.id, inventory, payload["gpu_ids"]) != payload["occupancy"]:
+                continue
+            try:
+                enforce_lease(db, user, payload["lease_days"])
+            except HTTPException:
                 continue
             c.status = "provisioning"
             db.commit()
@@ -310,6 +324,8 @@ def _merge_action(node, action: str, old_id: str, data: dict):
         return finalize_gpu_merge(old_id, data["name"], data["replacement_id"], data["username"], data["old_gpu_ids"])
     agent = RemoteAgentClient(node.base_url, node.agent_token)
     if action == "merge":
+        if data.get("shrink"):
+            return agent.shrink_container(old_id, {key: value for key, value in data.items() if key != "shrink"})
         return agent.merge_container(old_id, data)
     if action == "rollback":
         return agent.rollback_merge(old_id, data)
@@ -324,18 +340,27 @@ def _close_merge_request(pending: ContainerModel) -> None:
     pending.name = f"{pending.name}-done-{pending.id}"
 
 
-def _perform_merge(db, target: ContainerModel, additional: list[int], user: UserModel, pending: ContainerModel | None = None, previous_approval: str | None = None) -> None:
+def _perform_merge(db, target: ContainerModel, additional: list[int], user: UserModel, pending: ContainerModel | None = None, previous_approval: str | None = None, keep_gpus: list[int] | None = None) -> None:
     node = get_node(db, target.node_id or NODE_ID)
     if not node:
         raise HTTPException(status_code=400, detail="目标节点不存在")
     old_gpus = [int(x) for x in target.gpu_ids.split(",")] if target.gpu_ids else []
-    new_gpus = sorted(set(old_gpus) | set(additional))
+    shrinking = keep_gpus is not None
+    if not shrinking:
+        enforce_lease(db, user, 1, expires_at=target.expires_at)
+    new_gpus = sorted(set(keep_gpus)) if shrinking else sorted(set(old_gpus) | set(additional))
+    if shrinking and (not new_gpus or not set(new_gpus) < set(old_gpus)):
+        raise HTTPException(status_code=400, detail="缩卡必须保留至少一张卡")
     old_id = target.container_id
     action = {"name": target.name, "username": user.username, "old_gpu_ids": old_gpus}
     target.status = "merging"
     target.gpu_idle_low_since = None
     target.gpu_idle_last_sample_at = None
-    target.gpu_ids = ",".join(map(str, new_gpus))
+    target.gpu_idle_stage_mask = 0
+    target.gpu_idle_warned_at = None
+    target.gpu_idle_memory_snapshot = None
+    target.gpu_idle_cards_json = None
+    target.gpu_ids = ",".join(map(str, old_gpus if shrinking else new_gpus))
     target.pending_share_json = json.dumps({"old_id": old_id, "old_gpus": old_gpus, "pending_id": pending.id if pending else None, "previous_approval": previous_approval})
     db.commit()
     try:
@@ -343,11 +368,13 @@ def _perform_merge(db, target: ContainerModel, additional: list[int], user: User
         data = {**action, "gpu_ids": new_gpus, "ssh_port": target.ssh_port,
                 "extra_ports": json.loads(target.extra_ports) if target.extra_ports else {},
                 "ssh_password_hash": hashlib.sha256(target.ssh_password.encode()).hexdigest(), "mem_limit_gb": gpu_mem_gb * len(new_gpus)}
+        if shrinking:
+            data["shrink"] = True
         result = _merge_action(node, "merge", old_id, data)
         replacement_id = result["container_id"]
         target.container_id = replacement_id
-        target.gpu_ids = ",".join(map(str, new_gpus))
-        target.pending_share_json = json.dumps({"old_id": old_id, "old_gpus": old_gpus, "pending_id": pending.id if pending else None, "phase": "finalize", "replacement_id": replacement_id})
+        target.gpu_ids = ",".join(map(str, old_gpus if shrinking else new_gpus))
+        target.pending_share_json = json.dumps({"old_id": old_id, "old_gpus": old_gpus, "pending_id": pending.id if pending else None, "phase": "finalize", "replacement_id": replacement_id, "shrink_gpus": new_gpus if shrinking else None})
         if pending:
             _close_merge_request(pending)
         db.commit()
@@ -369,12 +396,29 @@ def _perform_merge(db, target: ContainerModel, additional: list[int], user: User
         raise HTTPException(status_code=500, detail="合并失败，原容器已恢复") from exc
     try:
         _merge_action(node, "finalize", old_id, {**action, "replacement_id": replacement_id})
+        from app.gpu_history import resize_container_history
+        resize_container_history(db, node.id, old_id, replacement_id, new_gpus)
+        if shrinking:
+            _finish_idle_shrink(db, target, new_gpus, old_id)
         target.pending_share_json = None
         target.status = "running"
         db.commit()
     except Exception as exc:
         db.rollback()
         raise HTTPException(status_code=503, detail="新容器已运行但清理尚未完成，系统将重试恢复") from exc
+
+
+def _finish_idle_shrink(db, target, new_gpus, old_id):
+    from app.reputation_service import record_configured_event
+    record_configured_event(db, target.user_id, f"gpu-idle-shrunk-{target.id}-{old_id}", "idle_shrink", target.id)
+    removed = sorted({int(x) for x in target.gpu_ids.split(",")} - set(new_gpus))
+    target.gpu_ids = ",".join(map(str, new_gpus))
+    key = f"gpu-idle-shrunk-{target.id}-{old_id}"
+    if not db.query(UserNotificationModel).filter(UserNotificationModel.event_key == key).first():
+        db.add(UserNotificationModel(user_id=target.user_id, event_key=key,
+            type="gpu_idle_shrunk", title="长期闲置 GPU 已自动缩减",
+            message=f"容器 {target.name} 已释放 GPU {removed}，保留 GPU {new_gpus}。容器已重建运行，文件层和 workspace 保留，原进程不保留。",
+            container_id=target.id, container_name=target.name, created_at=datetime.now()))
 
 
 def recover_incomplete_merges(db) -> None:
@@ -393,6 +437,11 @@ def recover_incomplete_merges(db) -> None:
         try:
             if payload.get("phase") == "finalize" or target.status == "running":
                 _merge_action(node, "finalize", payload["old_id"], {**action, "replacement_id": payload.get("replacement_id") or target.container_id})
+                from app.gpu_history import resize_container_history
+                kept = payload.get("shrink_gpus") or [int(part) for part in target.gpu_ids.split(",") if part]
+                resize_container_history(db, node.id, payload["old_id"], payload.get("replacement_id") or target.container_id, kept)
+                if payload.get("shrink_gpus"):
+                    _finish_idle_shrink(db, target, payload["shrink_gpus"], payload["old_id"])
                 if pending and pending.status == "pending_share_approval":
                     _close_merge_request(pending)
             else:
@@ -420,6 +469,8 @@ def _provision_running_container(db, c: ContainerModel, lease_days: int, previou
         raise HTTPException(status_code=400, detail=detail)
 
     gpu_ids = [int(x) for x in c.gpu_ids.split(",")] if c.gpu_ids else []
+    if c.target_container_id is None:
+        enforce_lease(db, user, lease_days, gpu=bool(gpu_ids))
     if c.target_container_id is not None:
         target = _merge_target(db, c.user_id, c.target_container_id, c.node_id or NODE_ID)
         if set(gpu_ids) & {int(x) for x in target.gpu_ids.split(",") if x}:
@@ -460,6 +511,7 @@ def _provision_running_container(db, c: ContainerModel, lease_days: int, previou
     prefix = "labcpu" if not gpu_ids else "labgpu"
     safe_name = f"{prefix}-{user.username}-{datetime.now().strftime('%Y%m%d%H%M')}-{uuid.uuid4().hex[:8]}"
 
+    enforce_lease(db, user, lease_days, gpu=bool(gpu_ids))
     try:
         provisioned = provision_on_node(node, safe_name, user.username, gpu_ids, mem_limit_gb)
     except (RuntimeError, RemoteAgentError) as e:
@@ -498,14 +550,15 @@ def apply_container(req: ContainerApplyRequest, user=Depends(get_current_user), 
         detail = "暂时无法确认工作区容量，请稍后重试" if not quota.scan_complete else "工作区已超过磁盘配额，请清理文件后再申请容器"
         raise HTTPException(status_code=400, detail=detail)
 
-    if req.lease_days < 1 or req.lease_days > MAX_LEASE_DAYS:
-        raise HTTPException(status_code=400, detail=f"租期须在 1~{MAX_LEASE_DAYS} 天之间")
+    if req.target_container_id is None:
+        enforce_lease(db, user, req.lease_days, gpu=not req.cpu_only)
 
     target = None
     if req.target_container_id is not None:
         if req.cpu_only:
             raise HTTPException(status_code=400, detail="合并 GPU 不能选择纯 CPU 模式")
         target = _merge_target(db, user.id, req.target_container_id)
+        enforce_lease(db, user, 1, expires_at=target.expires_at)
         if req.placement_mode == "local" and (target.node_id or NODE_ID) != NODE_ID:
             raise HTTPException(status_code=400, detail="新增 GPU 必须与目标容器位于同一节点")
         if req.node_id and req.node_id != (target.node_id or NODE_ID):
@@ -608,7 +661,12 @@ def apply_container(req: ContainerApplyRequest, user=Depends(get_current_user), 
 
     if occupiers:
         approvers = [{"user_id": uid, "username": uname, "approved": False, "approved_at": None} for uid, uname in occupiers]
-        payload = {"lease_days": req.lease_days, "approvers": approvers}
+        occupancy = db.query(ContainerModel).filter(
+            ContainerModel.node_id == node.id, ContainerModel.status.in_(["running", "merging"]),
+            ContainerModel.user_id.in_([uid for uid, _ in occupiers])).all()
+        payload = {"lease_days": req.lease_days, "approvers": approvers,
+                   "occupancy": [{"id": row.id} for row in occupancy
+                                 if {int(value) for value in (row.gpu_ids or "").split(",") if value.strip()} & set(gpu_ids)]}
         pend_name = f"labgpu-{user.username}-pend-{datetime.now().strftime('%Y%m%d%H%M')}-{uuid.uuid4().hex[:8]}"
         pending_cid = f"pending-{uuid.uuid4().hex}"
         far_expires = datetime.now() + timedelta(days=3650)
@@ -652,6 +710,7 @@ def apply_container(req: ContainerApplyRequest, user=Depends(get_current_user), 
     else:
         mem_limit_gb = int(get_setting("cpu_mem_gb", str(DEFAULT_CPU_MEM_GB)))
 
+    enforce_lease(db, user, req.lease_days, gpu=bool(gpu_ids))
     try:
         provisioned = provision_on_node(node, container_name, user.username, gpu_ids, mem_limit_gb)
     except (RuntimeError, RemoteAgentError) as e:

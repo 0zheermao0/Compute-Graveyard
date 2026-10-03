@@ -1,6 +1,8 @@
 from datetime import datetime, timedelta
 from types import SimpleNamespace
 
+import pytest
+
 from app.scheduler import _candidate_still_reclaimable
 from app.settings_service import SettingsValues, idle_policy_signature
 
@@ -44,10 +46,14 @@ def container(now):
     return SimpleNamespace(
         id=1,
         status="running",
+        expires_at=now + timedelta(days=1),
         container_id="docker-id",
         gpu_ids="0",
         gpu_idle_low_since=now - timedelta(hours=2),
         gpu_idle_last_sample_at=now,
+        gpu_idle_stage_mask=31,
+        gpu_idle_warned_at=now - timedelta(minutes=12),
+        gpu_idle_memory_snapshot=None,
     )
 
 
@@ -67,7 +73,47 @@ def test_policy_change_before_removal_clears_timer(monkeypatch):
     assert current is None
     assert current_settings is None
     assert value.gpu_idle_low_since is None
+    assert value.gpu_idle_stage_mask == 0
+    assert value.gpu_idle_warned_at is None
+    assert value.gpu_idle_memory_snapshot is None
     assert db.commits == 1
+
+
+@pytest.mark.parametrize("field,changed", [
+    ("gpu_idle_stage_mask", 15),
+    ("gpu_idle_warned_at", None),
+    ("gpu_idle_last_sample_at", datetime(2026, 1, 1)),
+    ("container_id", "different-docker-id"),
+    ("gpu_ids", "1"),
+    ("expires_at", datetime(2026, 1, 1, 2)),
+])
+def test_incomplete_or_changed_candidate_is_not_removed(monkeypatch, field, changed):
+    now = datetime(2026, 1, 1, 2)
+    value = container(now)
+    snapshot = {"container_id": "docker-id", "gpu_ids": "0", "low_since": value.gpu_idle_low_since}
+    setattr(value, field, changed)
+    db = FakeDb(value)
+    current_values = settings()
+    monkeypatch.setattr("app.scheduler.load_settings", lambda _: current_values)
+    current, _ = _candidate_still_reclaimable(db, value.id, snapshot, idle_policy_signature(current_values), now)
+    assert current is None
+    assert value.gpu_idle_stage_mask == 0
+    assert value.gpu_idle_warned_at is None
+
+
+def test_complete_candidate_is_reclaimable(monkeypatch):
+    now = datetime(2026, 1, 1, 2)
+    value = container(now)
+    db = FakeDb(value)
+    current_values = settings()
+    monkeypatch.setattr("app.scheduler.load_settings", lambda _: current_values)
+    current, _ = _candidate_still_reclaimable(
+        db, value.id,
+        {"container_id": "docker-id", "gpu_ids": "0", "low_since": value.gpu_idle_low_since},
+        idle_policy_signature(current_values), now,
+    )
+    assert current is value
+    assert db.commits == 0
 
 
 def test_status_change_before_removal_clears_timer(monkeypatch):
@@ -87,4 +133,7 @@ def test_status_change_before_removal_clears_timer(monkeypatch):
     assert current is None
     assert current_settings is None
     assert value.gpu_idle_low_since is None
+    assert value.gpu_idle_stage_mask == 0
+    assert value.gpu_idle_warned_at is None
+    assert value.gpu_idle_memory_snapshot is None
     assert db.commits == 1

@@ -89,17 +89,21 @@ def master_workspace(username):
 
 
 def reject_unapproved_occupancy(db, gpu_ids, target_id=None, old_gpu_ids=()):
-    want = set(gpu_ids)
-    if not want:
+    # Existing cards already belong to the target's approved occupancy. A shrink
+    # creates no new occupancy and must not trigger another owner's approval.
+    want = set(gpu_ids) - set(old_gpu_ids) if target_id else set(gpu_ids)
+    if not want and not target_id:
         return
-    rows = db.query(ContainerModel).filter(ContainerModel.node_id == NODE_ID, ContainerModel.status.in_(["running", "merging"])).all()
-    if any(_gpu_set(row.gpu_ids) & want for row in rows):
-        raise HTTPException(status_code=409, detail="所选 GPU 有 Worker 本地容器占用，须通过共用审批")
     runtime = list_managed_containers()
     targets = [item for item in runtime if item.get("container_id") == target_id]
     if target_id and (len(targets) != 1 or targets[0].get("status") != "running" or
                       _gpu_set(targets[0].get("gpu_ids")) != set(old_gpu_ids)):
         raise HTTPException(status_code=409, detail="目标容器 GPU 状态不一致")
+    if not want:
+        return
+    rows = db.query(ContainerModel).filter(ContainerModel.node_id == NODE_ID, ContainerModel.status.in_(["running", "merging"])).all()
+    if any(_gpu_set(row.gpu_ids) & want for row in rows):
+        raise HTTPException(status_code=409, detail="所选 GPU 有 Worker 本地容器占用，须通过共用审批")
     for item in runtime:
         if _gpu_set(item.get("gpu_ids")) & want and item.get("status") in ("running", "merging"):
             if item.get("container_id") != target_id or _gpu_set(item.get("gpu_ids")) != set(old_gpu_ids):

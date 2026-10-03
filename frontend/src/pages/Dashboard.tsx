@@ -2,6 +2,7 @@ import { useState, useEffect, useRef } from "react";
 import { fetcher } from "../api/client";
 import ApplyModal from "../components/ApplyModal";
 import GPUTwin from "../components/GPUTwin";
+import GPUHistory from "../components/GPUHistory";
 import "./Dashboard.css";
 
 export interface GPUInfo {
@@ -16,6 +17,7 @@ export interface GPUInfo {
 
 interface Occupancy {
   gpu_index: number;
+  origin?: string | null;
   container_name: string;
   username: string;
   display_name: string;
@@ -54,13 +56,6 @@ interface DiskRankItem {
   username: string;
   real_name?: string | null;
   usage_bytes: number;
-}
-
-interface GPUUtilRankItem {
-  rank: number;
-  username: string;
-  real_name?: string | null;
-  estimated_percent: number;
 }
 
 interface ReminderRankItem {
@@ -134,8 +129,6 @@ interface DashboardData {
   weekly_ranking: UsageRankItem[];
   monthly_ranking: UsageRankItem[];
   disk_ranking: DiskRankItem[];
-  weekly_gpu_ranking: GPUUtilRankItem[];
-  monthly_gpu_ranking: GPUUtilRankItem[];
   reminder_ranking: ReminderRankItem[];
   gpu_sharing?: GpuSharingStatus[];
   max_gpu_sharing_users?: number;
@@ -147,7 +140,7 @@ export default function Dashboard() {
   const [error, setError] = useState("");
   const [showApply, setShowApply] = useState(false);
   const [isMaster, setIsMaster] = useState(false);
-  const [rankCategory, setRankCategory] = useState<RankingCategory>("duration");
+  const [rankCategory, setRankCategory] = useState<RankingCategory>("gpu");
   const [rankPeriod, setRankPeriod] = useState<"weekly" | "monthly">("weekly");
   const [rankHovered, setRankHovered] = useState(false);
   const [rankFocused, setRankFocused] = useState(false);
@@ -169,8 +162,6 @@ export default function Dashboard() {
     weekly_ranking: d.weekly_ranking ?? [],
     monthly_ranking: d.monthly_ranking ?? [],
     disk_ranking: d.disk_ranking ?? [],
-    weekly_gpu_ranking: d.weekly_gpu_ranking ?? [],
-    monthly_gpu_ranking: d.monthly_gpu_ranking ?? [],
     reminder_ranking: d.reminder_ranking ?? [],
     gpu_sharing: d.gpu_sharing ?? [],
   });
@@ -297,9 +288,7 @@ export default function Dashboard() {
 
   const ranking = rankCategory === "disk"
     ? (data?.disk_ranking ?? [])
-    : rankCategory === "gpu"
-      ? (rankPeriod === "weekly" ? data?.weekly_gpu_ranking ?? [] : data?.monthly_gpu_ranking ?? [])
-      : (rankPeriod === "weekly" ? data?.weekly_ranking ?? [] : data?.monthly_ranking ?? []);
+    : (rankPeriod === "weekly" ? data?.weekly_ranking ?? [] : data?.monthly_ranking ?? []);
   const dashboardNodes: DashboardNode[] = data
     ? data.nodes?.length
       ? data.nodes
@@ -362,7 +351,6 @@ export default function Dashboard() {
           )}
 
           <section className="dashboard-nodes">
-            <h2>计算节点</h2>
             {dashboardNodes.map((node) => (
               <article className={`dashboard-node ${node.online ? "online" : "offline"}`} key={node.node_id}>
                 <div className="dashboard-node-header">
@@ -441,7 +429,7 @@ export default function Dashboard() {
 
         <div className="dashboard-sidebar">
         <aside className="ranking-panel" onMouseEnter={() => setRankHovered(true)} onMouseLeave={() => setRankHovered(false)} onFocusCapture={() => setRankFocused(true)} onBlurCapture={(event) => { if (!event.currentTarget.contains(event.relatedTarget)) setRankFocused(false); }}>
-          <h2>{rankCategory === "duration" ? "使用时长排行" : rankCategory === "disk" ? "磁盘使用排行" : "GPU 平均利用率排行 · 估算"}</h2>
+          <h2>{rankCategory === "duration" ? "使用时长排行" : rankCategory === "disk" ? "磁盘使用排行" : "GPU 利用统计"}</h2>
           <div className="ranking-tabs" aria-label="排行类型">
             {rankingCategories.map((category) => (
               <button key={category} type="button" className={rankCategory === category ? "active" : ""} aria-pressed={rankCategory === category} onClick={() => setRankCategory(category)}>
@@ -449,26 +437,34 @@ export default function Dashboard() {
               </button>
             ))}
           </div>
-          {rankCategory !== "disk" && (
+          {rankCategory === "duration" && (
             <div className="ranking-tabs" aria-label="排行周期">
               <button type="button" className={rankPeriod === "weekly" ? "active" : ""} aria-pressed={rankPeriod === "weekly"} onClick={() => setRankPeriod("weekly")}>本周</button>
               <button type="button" className={rankPeriod === "monthly" ? "active" : ""} aria-pressed={rankPeriod === "monthly"} onClick={() => setRankPeriod("monthly")}>本月</button>
             </div>
           )}
-          <p className="ranking-note">{rankCategory === "disk" ? "当前已完成扫描的用户空间快照；非周/月累计" : rankCategory === "gpu" ? "估算：当前整卡利用率 × (0.7 + 0.3 × 显存占比)，按已验证运行占用人数均分，再按窗口内占用时长加权；非历史实测" : "容器累计使用时长"}</p>
+          <div hidden={rankCategory !== "gpu"}>
+            <GPUHistory
+              visible={rankCategory === "gpu"}
+              activeNodes={data ? dashboardNodes.filter((node) => node.online && !node.error && (node.is_local || remoteLoaded)) : undefined}
+            />
+          </div>
+          {rankCategory !== "gpu" && <>
+          <p className="ranking-note">{rankCategory === "disk" ? "当前已完成扫描的用户空间快照；非周/月累计" : "容器累计使用时长"}</p>
           <ul className="ranking-list" key={`${rankCategory}-${rankCategory === "disk" ? "current" : rankPeriod}`}>
             {ranking.length ? (
               ranking.map((r) => (
-                <li key={"estimated_percent" in r ? `${r.username}-${r.real_name}` : r.username}>
+                <li key={r.username}>
                   <span className="rank-num">{r.rank}</span>
                   <span className="rank-user">{r.real_name || r.username}</span>
-                  <span className="rank-hours">{"usage_bytes" in r ? formatGiB(r.usage_bytes) : "estimated_percent" in r ? `${r.estimated_percent}%` : `${r.total_hours}h`}</span>
+                  <span className="rank-hours">{"usage_bytes" in r ? formatGiB(r.usage_bytes) : `${r.total_hours}h`}</span>
                 </li>
               ))
             ) : (
               <li className="rank-empty">暂无数据</li>
             )}
           </ul>
+          </>}
         </aside>
         {!!data?.reminder_ranking?.length && (
           <aside className="ranking-panel reminder-panel" aria-labelledby="reminder-heading">
@@ -478,7 +474,7 @@ export default function Dashboard() {
                 <li key={user.username}>
                   <span className="rank-num">{index + 1}</span>
                   <span className="rank-user">{user.real_name || user.username}</span>
-                  <span className="rank-hours" aria-label={`${user.unread_count} 条待处理通知`}>{user.unread_count} 条</span>
+                  <span className="rank-hours" aria-label={`${user.unread_count} 条未读通知`}>{user.unread_count} 条</span>
                 </li>
               ))}
             </ul>

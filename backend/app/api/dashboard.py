@@ -4,10 +4,11 @@ from threading import Lock
 from time import monotonic
 
 from fastapi import APIRouter, Depends
+from sqlalchemy import func
 
 from app.auth import get_current_user
 from app.database import get_db
-from app.database_models import ContainerModel, ShareRequestModel, UserModel
+from app.database_models import ContainerModel, ShareRequestModel, UserModel, UserNotificationModel
 from app.api.containers import _parse_share_payload, _remote_share_status, lease_reminder_active, pending_share_approver_ids, remote_share_approver_ids
 from app.docker_service import get_gpu_info, get_system_load
 from app.database import get_setting
@@ -142,6 +143,16 @@ def _compute_ranking(db, since: datetime) -> list:
 def _reminder_ranking(db, now: datetime, local_only: bool = False) -> list[ReminderRankItem]:
     users = db.query(UserModel).all()
     counts = {user.id: 0 for user in users}
+    # 所有类型的未读站内事件均计入，已读历史通知不再提醒。
+    unread_events = (
+        db.query(UserNotificationModel.user_id, func.count(UserNotificationModel.id))
+        .filter(UserNotificationModel.read_at.is_(None))
+        .group_by(UserNotificationModel.user_id)
+        .all()
+    )
+    for user_id, unread_count in unread_events:
+        if user_id in counts:
+            counts[user_id] += unread_count
     for container in db.query(ContainerModel).filter(ContainerModel.status == "pending_share_approval").all():
         payload = _parse_share_payload(container.pending_share_json)
         if not payload:
@@ -214,6 +225,12 @@ def _estimated_gpu_ranking(nodes: list[DashboardNode], now: datetime, days: int)
         GPUUtilRankItem(rank=index, username=user[1], real_name=f"{names[user]} ({user[0]}: {user[1]})" if user in duplicate_names else names[user], estimated_percent=round(weighted[user] / hours_by_user[user], 1))
         for index, user in enumerate(ranked, 1)
     ]
+
+
+@router.get("/gpu-history")
+def get_gpu_history(db=Depends(get_db), _=Depends(get_current_user)):
+    from app.gpu_history import history_response
+    return history_response(db)
 
 
 @router.get("", response_model=DashboardResponse)

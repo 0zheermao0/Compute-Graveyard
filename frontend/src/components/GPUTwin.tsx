@@ -271,11 +271,7 @@ export default function GPUTwin({
     <section className="twin-wrap">
       <div className="twin-grid-bg" />
       <div className="twin-glow" />
-      <div className="twin-motherboard">
-        <svg preserveAspectRatio="none">
-          <path d="M100,0 L100,1000 M500,0 L500,1000 M900,0 L900,1000" stroke="#00ffcc" strokeWidth="1" fill="none" strokeDasharray="4 4" />
-        </svg>
-      </div>
+      <div className="twin-motherboard" />
       <div className="twin-grid">
         {list.map((data) => (
           <div key={data.id} className="twin-row">

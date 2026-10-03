@@ -14,7 +14,7 @@ from app.api import admin, agent, containers, dashboard
 from app.auth import create_access_token
 from app.container_lifecycle import remove_container_record
 from app.database import Base, _migrate_compute_nodes, get_db
-from app.database_models import ComputeNodeModel, ContainerModel, ShareRequestModel, UserModel
+from app.database_models import ComputeNodeModel, ContainerModel, ShareRequestModel, UserModel, UserNotificationModel
 from app.node_service import aggregate_inventories, build_service_url, node_response, select_node, verified_owners
 from app.remote_agent import normalize_agent_base_url
 
@@ -563,6 +563,7 @@ def test_cpu_auto_placement_ignores_external_gpu_occupancy(monkeypatch):
 
 
 def test_remote_removal_routes_through_node_runtime(monkeypatch):
+    monkeypatch.setattr("app.container_lifecycle.reject_shares_for_exit", lambda *args, **kwargs: None)
     container = SimpleNamespace(
         id=1,
         name="remote-container",
@@ -956,6 +957,47 @@ def test_reminder_ranking_counts_and_order(monkeypatch):
         assert ranked[1].username == "user01"
         assert all(row.username != "user03" for row in ranked)
         assert set(ranked[0].model_dump()) == {"username", "real_name", "unread_count"}
+    engine.dispose()
+
+
+@pytest.mark.parametrize("role", ["master", "worker"])
+@pytest.mark.parametrize("local_only", [False, True])
+def test_reminder_ranking_includes_all_unread_notifications(monkeypatch, role, local_only):
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    monkeypatch.setattr(dashboard, "NODE_ROLE", role)
+    monkeypatch.setattr(containers, "NODE_ROLE", role)
+    with Session(engine) as db:
+        alice = UserModel(id=1, username="alice", hashed_password="x")
+        bob = UserModel(id=2, username="bob", hashed_password="x")
+        db.add_all([alice, bob])
+        now = datetime.now()
+        db.add(ContainerModel(id=1, name="removed", user_id=1, status="removed", ssh_port=22000,
+                              expires_at=now - timedelta(hours=1)))
+        db.add(ContainerModel(name="soon", user_id=2, status="running", ssh_port=22001,
+                              expires_at=now + timedelta(hours=2)))
+        events = [UserNotificationModel(
+            user_id=1, event_key=f"event-{index}", type=kind, title="通知", message="详情",
+            container_id=1,
+        ) for index, kind in enumerate([
+            "gpu_idle_warning", "gpu_idle_reclaimed", "gpu_idle_shrink_warning", "gpu_idle_shrunk", "future_type",
+        ])]
+        db.add_all(events)
+        db.add(UserNotificationModel(user_id=2, event_key="read-event", type="gpu_idle_warning",
+                                     title="已读", message="详情", read_at=now))
+        db.commit()
+
+        def counts():
+            return {row.username: row.unread_count for row in dashboard._reminder_ranking(db, now, local_only)}
+
+        assert counts() == {"alice": 5, "bob": 1}
+        assert counts()["alice"] == containers.list_notifications(user=alice, db=db).unread_count
+        assert counts()["bob"] == containers.list_notifications(user=bob, db=db).unread_count
+        containers.mark_notification_read(events[0].id, user=alice, db=db)
+        assert counts() == {"alice": 4, "bob": 1}
+        for event in events[1:]:
+            containers.mark_notification_read(event.id, user=alice, db=db)
+        assert counts() == {"bob": 1}
     engine.dispose()
 
 

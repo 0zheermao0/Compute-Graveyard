@@ -21,9 +21,9 @@
 - **容器管理**：查看、停止、删除、续租容器；Master 可管理已注册 Worker 上的容器
 - **GPU 共用审批**：当目标 GPU 已被其他用户使用时，向占用者发起审批
 - **磁盘配额**：按用户限制工作区容量，超限后阻止新申请并可自动停止容器
-- **GPU 低利用回收**：连续低利用达到阈值后自动停止并销毁 GPU 容器，保留工作区
+- **GPU 低利用回收**：整卡指标连续异常、分阶段确认并提前预警后自动停止并销毁 GPU 容器，保留工作区
 - **工作区文件**：在线浏览、编辑、新建和删除个人文件
-- **用户与权限**：注册、登录、管理员审批和用户管理
+- **用户与权限**：注册、密码 / Passkey 登录、个人资料绑定通行密钥、管理员审批和用户管理
 - **安全 Agent API**：Worker 仅开放受保护的资源查询和容器操作接口，不暴露 Docker API
 - **用户容器镜像**：支持 NVIDIA CUDA、Miniconda、code-server 和 SSH，个人目录挂载至 `/workspace`
 
@@ -267,11 +267,45 @@ Docker Compose 会读取项目根目录的 `.env`，也可以直接设置环境�
 | `INITIAL_ADMIN_PASSWORD` | 空数据库首次启动时创建的管理员密码；为空则不自动创建 | 空 |
 | `INIT_ADMIN_TOKEN` | `/api/auth/init-admin` 所需的初始化 Bearer token | 空 |
 | `CORS_ORIGINS` | 允许的跨域来源，多个值用逗号分隔 | 空 |
+| `WEBAUTHN_RP_ID` | Passkey 绑定的稳定域名，不含协议、端口或路径 | `localhost` |
+| `WEBAUTHN_RP_NAME` | 浏览器中显示的 Passkey 站点名称 | `Compute Graveyard` |
+| `WEBAUTHN_ORIGINS` | Passkey 精确来源白名单，多个值用逗号分隔，包含协议及非标准端口 | `http://localhost` 的 `5173`、`3000`、`8000`、`8099` 端口 |
+| `FORWARDED_ALLOW_IPS` | Uvicorn 信任的反向代理 IP，多个值用逗号分隔；代理须覆盖转发头，后端应禁止绕过代理直连 | `127.0.0.1` |
 | `NOTIFY_WEBHOOK` | 到期、配额等通知的钉钉/飞书 Webhook | 空 |
 | `DATABASE_URL` | 数据库连接；默认使用当前节点本地 SQLite | `sqlite:///./data/lab_gpu.db` |
 | `DATA_DIR` | 应用数据目录；Compose 默认容器内 `/app/data` | `backend/data`（开发） |
 
 主从模式默认使用各节点独立 SQLite。不要把多个主从实例指向同一个 SQLite 文件；如果改用其他数据库，需要自行准备对应驱动和连接配置。
+
+### Passkey 登录与绑定
+
+先用密码登录，在「个人资料 / Profile」的 Passkey 区域输入名称和当前密码，按浏览器提示使用指纹、面容、设备 PIN 或安全密钥完成绑定。下次在登录页点击「使用 Passkey 登录」即可，无需填写用户名或密码。支持绑定多个密钥；删除密钥也需要当前密码确认，密码登录始终保留为恢复方式。
+
+生产站点需要通过反向代理提供 HTTPS，并显式配置实际访问域名，例如：
+
+```dotenv
+WEBAUTHN_RP_ID=gpu.example.com
+WEBAUTHN_RP_NAME=Lab GPU Manager
+WEBAUTHN_ORIGINS=https://gpu.example.com
+```
+
+- `WEBAUTHN_RP_ID` 必须等于来源的域名或其父域名；`WEBAUTHN_ORIGINS` 不含末尾斜杠或路径，非标准端口必须写入来源。跨域前端还需单独配置 `CORS_ORIGINS`。
+- 本地可使用 `http://localhost:8099` 或 Vite 的 `http://localhost:5173`；默认不接受 IP、局域网 HTTP 地址或其他端口。修改 RP 域名后，旧密钥不能用于新域名，需使用密码登录后重新绑定。
+- 绑定与登录要求认证器完成用户验证；挑战在 5 分钟后过期且只能使用一次。公开登录接口限流为每进程、每 IP、每接口 30 次/分钟，密码确认接口为 10 次/分钟；生产反向代理建议增加全局限流。Docker 中使用反向代理时，应将实际代理 IP 加入 `FORWARDED_ALLOW_IPS`，否则用户可能共用代理 IP 的限流额度；不要无条件信任任意转发头或设置为 `*`。
+- 旧数据库会自动添加凭据表及用户 handle 字段，不重建用户数据。Master / Worker 的账号及 Passkey 仍由各节点独立保存，不会自动同步。
+
+Passkey API（浏览器 WebAuthn 响应使用 JSON 格式）：
+
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| `GET` | `/api/auth/passkeys` | JWT；仅返回本人密钥的管理信息 |
+| `POST` | `/api/auth/passkeys/register/options` | JWT + `{password}`；获取绑定挑战 |
+| `POST` | `/api/auth/passkeys/register/verify` | JWT + `{challenge_id, credential, name}`；完成绑定 |
+| `POST` | `/api/auth/passkeys/login/options` | 获取免用户名登录挑战 |
+| `POST` | `/api/auth/passkeys/login/verify` | `{challenge_id, credential}`；返回与密码登录相同的 JWT 响应 |
+| `DELETE` | `/api/auth/passkeys/{id}` | JWT + JSON `{password}`；解除绑定 |
+
+`options` 接口返回 `{challenge_id, options}`；绑定/登录请求的 `Origin` 必须位于配置白名单中。解除绑定仅删除服务端凭据，不会自动删除设备或密码管理器中的通行密钥。
 
 ### 工作区、镜像和端口
 
@@ -327,9 +361,10 @@ Docker Compose 会读取项目根目录的 `.env`，也可以直接设置环境�
 规则：
 
 - 只处理 GPU 容器，不处理 CPU 容器。
-- 分配给容器的每一张 GPU 都必须同时低于利用率和显存阈值。
-- 达到连续低利用时长后立即停止并删除容器，宿主机工作区保留。
-- 指标缺失、采样中断超过 15 分钟、策略变化或出现高利用率时会重置计时。
+- 每 5 分钟采集整张物理 GPU 的指标。容器分配的所有 GPU 均须满足以下任一异常条件：`(util < 配置利用率阈值 AND memory_percent < 配置显存阈值) OR (util = 0 AND memory_used_mb > 0 AND memory_used_mb = 上一次有效采样的已用显存)`。第二种条件要求相邻有效采样的已用显存 MB 相同且大于 0，同时当前利用率为 0，不受显存占用阈值限制；首次采样没有基准，不能通过此分支判异常。双低阈值分支独立判断，不依赖显存不变或历史基准。
+- 从首次异常开始计时，以配置的连续低利用时长为 100%，要求 `0–10%`、`10–30%`、`30–50%`、`50–80%`、`80–100%` 五个阶段均有采样覆盖且持续异常；正常采样、指标缺失、采集中断超过 15 分钟或策略变化都会重置计时、阶段记录及预警状态。
+- 达到 80% 时发送站内通知和 Webhook 预警；达到 100% 时重新采集指标，只有仍异常、五个阶段覆盖完整且已预警才停止并删除容器，并发送回收通知。宿主机 `/workspace` 数据保留。
+- 判断依据仍是整卡指标，不是容器进程级指标，也不能识别高利用率空转。GPU 共享时，各容器使用同一张物理卡的指标，但按各自分配的完整 GPU 集合独立判断。
 - Master 会按容器所属节点执行本地或远程回收。
 - 每个节点都会运行自己的本地定时任务；不要让多个服务实例共享同一节点数据库。
 
@@ -451,6 +486,28 @@ Content-Type: application/json
 
 ---
 
+## 信誉分管理
+
+信誉分是可扩展的违规记分机制：分数越高，GPU 申请期限限制越严格。分数、变更记录及计分原因仅在管理员后台展示，不进入普通用户资料、通知或 Webhook。用户端仅显示可选期限，不说明计分原因。
+
+管理员可在 `/admin` 用户管理中调整、清零信誉分并查看记录，在「资源策略 → 信誉分与申请期限策略」配置以下默认规则：
+
+| 规则 | 默认值 |
+| --- | --- |
+| 新用户初始信誉分 | 0 |
+| 每条 GPU 闲置预警 | +1 |
+| 成功闲置回收 | +2 |
+| 每次成功自动缩卡（不按释放卡数） | +2 |
+| 到期自动销毁 | −2，最低 0 |
+| 分数严格大于 5 | GPU 最长 5 天 |
+| 分数严格大于 10 | GPU 最长 3 天，高档优先 |
+
+到期仍沿用原流程：先停止，24 小时后自动销毁成功才减分。失败操作、重复重试、手动删除、管理员删除及磁盘配额销毁不触发上述计分。迁移后已有用户从 0 开始，不追算历史；调整初始分只影响之后创建的用户。
+
+期限限制覆盖 GPU 新申请、审批后实际创建、每次续租，以及追加/合并 GPU 时原容器的剩余租期。纯 CPU 申请不受信誉分限制，已有容器不会因分数或策略变化被主动缩短租期。
+
+---
+
 ## 项目结构
 
 ```text
@@ -515,6 +572,7 @@ python -m pytest -q
 python -m compileall -q app main.py
 
 cd ../frontend
+node --test tests/applicationPolicy.test.mjs
 npm run build
 ```
 

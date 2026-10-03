@@ -1,5 +1,6 @@
 import { useState, useEffect } from "react";
 import { fetcher } from "../api/client";
+import { fetchApplicationPolicy } from "../api/applicationPolicy";
 import "./MyContainers.css";
 
 const PORT_LABELS: Record<string, string> = { 8888: "Jupyter", 6006: "TensorBoard", 8080: "Code Server" };
@@ -142,9 +143,13 @@ export default function MyContainers() {
   const handleRenew = async (id: number) => {
     setRenewing(id);
     try {
-      await fetcher(`/leases/renew/${id}`, { method: "POST", body: JSON.stringify({ lease_days: 3 }) });
+      const policy = await fetchApplicationPolicy();
+      const container = containers.find((item) => item.id === id);
+      if (!container) throw new Error("容器不存在，请刷新后重试");
+      const days = Math.min(3, container.gpu_ids.trim() ? policy.gpu_max_lease_days : policy.cpu_max_lease_days);
+      await fetcher(`/leases/renew/${id}`, { method: "POST", body: JSON.stringify({ lease_days: days }) });
       await load();
-      pushToast("续租成功！已延长 3 天", "success");
+      pushToast(`续租成功！已延长 ${days} 天`, "success");
     } catch (e) {
       pushToast(e instanceof Error ? e.message : "续租失败", "error");
     } finally {
@@ -290,7 +295,7 @@ export default function MyContainers() {
                         onClick={() => handleRenew(c.id)}
                         disabled={renewing === c.id}
                       >
-                        {renewing === c.id ? "续租中…" : "续租 3 天"}
+                        {renewing === c.id ? "续租中…" : "续租"}
                       </button>
                     )}
                     <button

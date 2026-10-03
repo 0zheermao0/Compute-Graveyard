@@ -105,6 +105,9 @@ class RemoteAgentClient:
     def merge_container(self, container_id: str, payload: dict) -> dict:
         return self._request("POST", f"/containers/{quote(container_id, safe='')}/merge", json=payload, timeout=AGENT_MERGE_TIMEOUT_SECONDS)
 
+    def shrink_container(self, container_id: str, payload: dict) -> dict:
+        return self._request("POST", f"/containers/{quote(container_id, safe='')}/shrink", json=payload, timeout=AGENT_MERGE_TIMEOUT_SECONDS)
+
     def rollback_merge(self, container_id: str, payload: dict) -> dict:
         return self._request("POST", f"/containers/{quote(container_id, safe='')}/merge/rollback", json=payload, timeout=AGENT_MERGE_TIMEOUT_SECONDS)
 

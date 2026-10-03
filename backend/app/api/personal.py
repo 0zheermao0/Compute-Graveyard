@@ -52,7 +52,7 @@ class PersonalContainer(BaseModel):
     service_scheme: str
 
 
-async def get_personal_user(credentials: HTTPAuthorizationCredentials = Depends(security), db=Depends(get_db)):
+def get_personal_user(credentials: HTTPAuthorizationCredentials = Depends(security), db=Depends(get_db)):
     if not credentials or credentials.scheme.lower() != "bearer" or not credentials.credentials.startswith("cgpat_"):
         raise HTTPException(status_code=401, detail="无效的个人 API 凭据")
     digest = hashlib.sha256(credentials.credentials.encode()).hexdigest()

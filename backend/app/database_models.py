@@ -1,5 +1,7 @@
 """SQLAlchemy 数据库模型"""
 from datetime import datetime
+import secrets
+
 from sqlalchemy import BigInteger, Column, Integer, String, DateTime, Boolean, Text, ForeignKey, UniqueConstraint, text
 from sqlalchemy.orm import relationship, synonym
 
@@ -13,6 +15,7 @@ class UserModel(Base):
     id = Column(Integer, primary_key=True, autoincrement=True)
     username = Column(String(64), unique=True, nullable=False, index=True)
     hashed_password = Column(String(128), nullable=False)
+    webauthn_user_handle = Column(String(64), nullable=True, unique=True, index=True, default=lambda: secrets.token_urlsafe(32))
     display_name = Column(String(64), default="")
     real_name = Column(String(64), default="")  # 实名
     contact_type = Column(String(16), default="")  # phone | wechat
@@ -20,6 +23,7 @@ class UserModel(Base):
     approved = Column(Integer, default=0)  # 0 待审批 1 已通过，admin 默认 1
     role = Column(String(16), default="user")  # user | admin
     created_at = Column(DateTime, default=datetime.now)
+    reputation_score = Column(Integer, nullable=False, default=0, server_default=text("0"))
     max_gpus_per_user = Column(Integer, nullable=False, default=MAX_GPUS_PER_USER, server_default=text(str(MAX_GPUS_PER_USER)))
     disk_quota_bytes = Column(BigInteger, nullable=False, default=DEFAULT_DISK_QUOTA_BYTES, server_default=text(str(DEFAULT_DISK_QUOTA_BYTES)))
     disk_usage_bytes = Column(BigInteger, nullable=False, default=0, server_default=text("0"))
@@ -36,6 +40,39 @@ class UserModel(Base):
     quota_blocked = synonym("disk_quota_blocked")
     containers = relationship("ContainerModel", back_populates="owner")
     personal_tokens = relationship("PersonalTokenModel", back_populates="owner", cascade="all, delete-orphan")
+    passkeys = relationship("PasskeyModel", back_populates="owner", cascade="all, delete-orphan")
+    passkey_challenges = relationship("PasskeyChallengeModel", back_populates="owner", cascade="all, delete-orphan")
+
+
+class PasskeyModel(Base):
+    __tablename__ = "passkeys"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    credential_id = Column(Text, unique=True, nullable=False)
+    public_key = Column(Text, nullable=False)
+    sign_count = Column(BigInteger, nullable=False, default=0)
+    rp_id = Column(String(253), nullable=False)
+    name = Column(String(100), nullable=False)
+    transports = Column(Text, nullable=False, default="[]")
+    device_type = Column(String(32), nullable=False)
+    backed_up = Column(Boolean, nullable=False, default=False)
+    created_at = Column(DateTime, nullable=False, default=datetime.now)
+    last_used_at = Column(DateTime, nullable=True)
+    owner = relationship("UserModel", back_populates="passkeys")
+
+
+class PasskeyChallengeModel(Base):
+    __tablename__ = "passkey_challenges"
+
+    id = Column(String(64), primary_key=True)
+    challenge = Column(String(128), nullable=False)
+    kind = Column(String(16), nullable=False)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=True, index=True)
+    rp_id = Column(String(253), nullable=False)
+    origin = Column(String(512), nullable=False)
+    expires_at = Column(DateTime, nullable=False, index=True)
+    owner = relationship("UserModel", back_populates="passkey_challenges")
 
 
 class PersonalTokenModel(Base):
@@ -104,6 +141,10 @@ class ContainerModel(Base):
     created_at = Column(DateTime, default=datetime.now)
     gpu_idle_low_since = Column(DateTime, nullable=True)
     gpu_idle_last_sample_at = Column(DateTime, nullable=True)
+    gpu_idle_stage_mask = Column(Integer, nullable=False, default=0, server_default=text("0"))
+    gpu_idle_warned_at = Column(DateTime, nullable=True)
+    gpu_idle_cards_json = Column(Text, nullable=True)  # Per-card windows and runtime identity
+    gpu_idle_memory_snapshot = Column(Text, nullable=True)  # JSON: 每张 GPU 上一采样 memory_used_mb
     removal_reason = Column(String(256), nullable=True)
     removed_at = Column(DateTime, nullable=True)
     # GPU 共用审批：pending_share_json 存 JSON（lease_days、approvers 等），仅在 status=pending_share_approval 时有值
@@ -134,6 +175,39 @@ class LeaseRecordModel(Base):
     expires_at = Column(DateTime, nullable=False)
     created_at = Column(DateTime, default=datetime.now)
     container = relationship("ContainerModel", back_populates="lease_records")
+
+
+class GPUHistorySampleModel(Base):
+    __tablename__ = "gpu_history_samples"
+    __table_args__ = (UniqueConstraint("node_id", "gpu_index", "sampled_at"),)
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    node_id = Column(String(64), nullable=False, index=True)
+    node_name = Column(String(128), nullable=False)
+    gpu_index = Column(Integer, nullable=False)
+    gpu_name = Column(String(128), nullable=False)
+    sampled_at = Column(DateTime, nullable=False, index=True)
+    utilization = Column(Integer, nullable=True)
+    memory_used_mb = Column(BigInteger, nullable=True)
+    memory_total_mb = Column(BigInteger, nullable=True)
+    owners_json = Column(Text, nullable=False, default="[]")
+
+
+class ReputationEventModel(Base):
+    __tablename__ = "reputation_events"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    event_key = Column(String(256), unique=True, nullable=False)
+    event_type = Column(String(64), nullable=False)
+    reason = Column(Text, nullable=False, default="", server_default=text("''"))
+    source = Column(String(64), nullable=False, default="custom", server_default=text("'custom'"))
+    delta = Column(Integer, nullable=False)
+    score_before = Column(Integer, nullable=False)
+    score_after = Column(Integer, nullable=False)
+    actor_id = Column(Integer, nullable=True)
+    container_id = Column(Integer, nullable=True)
+    created_at = Column(DateTime, nullable=False, default=datetime.now)
 
 
 class SystemSettings(Base):

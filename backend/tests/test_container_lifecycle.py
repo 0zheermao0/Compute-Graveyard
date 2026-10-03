@@ -1,7 +1,14 @@
 from datetime import datetime
 from types import SimpleNamespace
 
+import pytest
+
 from app.container_lifecycle import RemovalResult, remove_container_record
+
+
+@pytest.fixture(autouse=True)
+def mock_share_exit(monkeypatch):
+    monkeypatch.setattr("app.container_lifecycle.reject_shares_for_exit", lambda *args, **kwargs: None)
 
 
 class FakeDb:

@@ -8,7 +8,7 @@ from pydantic import BaseModel, Field, field_validator
 
 from app.config import AGENT_API_TOKEN, NODE_ID, NODE_NAME, NODE_PUBLIC_HOST, NODE_ROLE, NODE_SERVICE_SCHEME
 from app.database import get_db
-from app.database_models import ComputeNodeModel, ShareRequestModel
+from app.database_models import ComputeNodeModel, ContainerModel, ShareRequestModel
 from app.worker_share import create_request, expire_request, master_workspace, reject_unapproved_occupancy, require_current, validated_result, verified_runtime, view, worker_gpu_lock
 from app.node_service import active_owners
 from app.docker_service import allocate_service_ports, allocate_ssh_port, create_container, finalize_gpu_merge, get_docker_client, is_managed_container, list_managed_containers, merge_container_gpus, remove_container, rollback_gpu_merge, stop_container
@@ -270,8 +270,17 @@ class AgentMergeFinalize(AgentMergeAction):
     replacement_id: str = Field(min_length=1, max_length=64, pattern=r"^[a-f0-9]{1,64}$")
 
 
+@router.post("/containers/{container_id}/shrink", dependencies=[Depends(require_agent_token)])
+def shrink(container_id: str, req: AgentMergeRequest, db=Depends(get_db)):
+    return _resize(container_id, req, db, shrink=True)
+
+
 @router.post("/containers/{container_id}/merge", dependencies=[Depends(require_agent_token)])
 def merge(container_id: str, req: AgentMergeRequest, db=Depends(get_db)):
+    return _resize(container_id, req, db)
+
+
+def _resize(container_id, req, db, shrink=False):
     with _create_lock:
         reject_unapproved_occupancy(db, req.gpu_ids, container_id, req.old_gpu_ids)
         target = next((item for item in list_managed_containers() if item.get("container_id") == container_id), None)
@@ -280,7 +289,7 @@ def merge(container_id: str, req: AgentMergeRequest, db=Depends(get_db)):
         _require_managed(container_id)
         try:
             workspace_path = master_workspace(req.username)
-            replacement_id = merge_container_gpus(container_id, req.name, req.username, req.old_gpu_ids, req.gpu_ids, req.ssh_port, req.extra_ports, req.ssh_password_hash, req.mem_limit_gb, workspace_path=workspace_path)
+            replacement_id = merge_container_gpus(container_id, req.name, req.username, req.old_gpu_ids, req.gpu_ids, req.ssh_port, req.extra_ports, req.ssh_password_hash, req.mem_limit_gb, workspace_path=workspace_path, shrink=shrink)
         except RuntimeError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         return {"container_id": replacement_id}
@@ -298,13 +307,21 @@ def rollback_merge(container_id: str, req: AgentMergeAction):
 
 
 @router.post("/containers/{container_id}/merge/finalize", dependencies=[Depends(require_agent_token)])
-def finalize_merge(container_id: str, req: AgentMergeFinalize):
+def finalize_merge(container_id: str, req: AgentMergeFinalize, db=Depends(get_db)):
     with _create_lock:
-        _require_managed(container_id)
+        # The old container may already have been deleted by a previous finalize attempt.
+        _require_managed(req.replacement_id)
         try:
             finalize_gpu_merge(container_id, req.name, req.replacement_id, req.username, req.old_gpu_ids)
         except Exception as exc:
             raise HTTPException(status_code=409, detail="替代容器未能完成清理") from exc
+        from app.gpu_history import resize_container_history
+        replacement = next((row for row in list_managed_containers()
+                            if row.get("container_id") == req.replacement_id), None)
+        if replacement:
+            kept = [int(part) for part in str(replacement.get("gpu_ids") or "").split(",") if part.strip()]
+            resize_container_history(db, NODE_ID, container_id, req.replacement_id, kept)
+            db.commit()
         return {"status": "finalized"}
 
 
@@ -401,20 +418,30 @@ def create(req: AgentContainerCreate, db=Depends(get_db)):
 
 
 @router.post("/containers/{container_id}/stop", dependencies=[Depends(require_agent_token)])
-def stop(container_id: str):
+def stop(container_id: str, db=Depends(get_db)):
     with _create_lock:
         _require_managed(container_id)
         _require_not_merging(container_id)
         if not stop_container(container_id):
             raise HTTPException(status_code=500, detail="停止容器失败")
+        from app.share_lifecycle import reject_shares_for_exit
+        owner = db.query(ContainerModel).filter(ContainerModel.container_id == container_id,
+                                                ContainerModel.node_id == NODE_ID).first()
+        reject_shares_for_exit(db, owner, docker_id=container_id)
+        db.commit()
         return {"status": "stopped", "container_id": container_id}
 
 
 @router.delete("/containers/{container_id}", dependencies=[Depends(require_agent_token)])
-def delete(container_id: str):
+def delete(container_id: str, db=Depends(get_db)):
     with _create_lock:
         _require_managed(container_id)
         _require_not_merging(container_id)
         if not remove_container(container_id):
             raise HTTPException(status_code=500, detail="删除容器失败")
+        from app.share_lifecycle import reject_shares_for_exit
+        owner = db.query(ContainerModel).filter(ContainerModel.container_id == container_id,
+                                                ContainerModel.node_id == NODE_ID).first()
+        reject_shares_for_exit(db, owner, docker_id=container_id)
+        db.commit()
         return {"status": "removed", "container_id": container_id}

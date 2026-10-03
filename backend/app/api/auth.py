@@ -22,6 +22,11 @@ def _do_login(username: str, password: str, db):
     user = db.query(UserModel).filter(UserModel.username == username).first()
     if not user or not verify_password(password, user.hashed_password):
         raise HTTPException(status_code=401, detail="用户名或密码错误")
+    return complete_login(user)
+
+
+def complete_login(user):
+    """密码和 Passkey 登录共用审批检查与 JWT 响应。"""
     if not user.approved and user.role != "admin":
         raise HTTPException(status_code=403, detail="账号尚未通过管理员审批，请联系管理员")
     token = create_access_token(data={"sub": user.username})
@@ -68,7 +73,9 @@ def init_admin(
         raise HTTPException(status_code=503, detail="未配置初始管理员密码")
     if db.query(UserModel).count() != 0:
         raise HTTPException(status_code=409, detail="系统已初始化")
+    from app.settings_service import load_settings
     admin = UserModel(
+        reputation_score=load_settings(db).reputation_initial_score,
         username=INITIAL_ADMIN_USERNAME,
         hashed_password=get_password_hash(INITIAL_ADMIN_PASSWORD),
         role="admin",
@@ -98,7 +105,9 @@ def register(req: UserRegister, db=Depends(get_db)):
         raise HTTPException(status_code=400, detail="请填写实名和联系方式")
     if db.query(UserModel).filter(UserModel.username == username).first():
         raise HTTPException(status_code=400, detail="用户名已存在")
+    from app.settings_service import load_settings
     user = UserModel(
+        reputation_score=load_settings(db).reputation_initial_score,
         username=username,
         hashed_password=get_password_hash(req.password),
         display_name=req.real_name,

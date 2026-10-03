@@ -1,0 +1,89 @@
+.profile-passkey-section {
+  max-width: none;
+}
+
+.profile-passkey-section .profile-form {
+  max-width: none;
+}
+
+.profile-passkey-section .profile-form > .profile-hint {
+  margin: 0 0 1rem;
+}
+
+.profile-passkey-section .btn:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+  transform: none;
+}
+
+.profile-passkey-message {
+  margin-top: 1rem;
+}
+
+.profile-passkey-list-heading {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 0.75rem;
+  margin: 1.25rem 0 0.75rem;
+}
+
+.profile-passkey-list-heading h3 {
+  margin: 0;
+  font-size: 0.9rem;
+}
+
+.profile-passkey-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.profile-passkey-list > li {
+  padding: 0.75rem 0;
+  border-top: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.profile-passkey-summary {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 0.75rem;
+}
+
+.profile-passkey-summary > div {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.profile-passkey-summary > button {
+  flex-shrink: 0;
+}
+
+.profile-passkey-delete {
+  color: var(--danger);
+}
+
+.profile-passkey-delete-form {
+  margin-top: 0.75rem;
+  padding: 0.75rem;
+  background: rgba(255, 107, 107, 0.05);
+  border: 1px solid rgba(255, 107, 107, 0.15);
+  border-radius: var(--radius-sm);
+}
+
+.profile-passkey-delete-form > .profile-hint {
+  margin: 0 0 0.75rem;
+}
+
+.profile-passkey-delete-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+}
+
+@media (max-width: 768px) {
+  .profile-passkey-section {
+    max-width: none;
+  }
+}

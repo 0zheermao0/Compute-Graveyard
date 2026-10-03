@@ -469,6 +469,7 @@ def test_disk_quota_enforcement_waits_until_grace_period(monkeypatch):
 
 
 def test_disk_quota_stop_marks_all_running_containers(monkeypatch):
+    monkeypatch.setattr("app.scheduler.reject_shares_for_exit", lambda *args, **kwargs: None)
     now = datetime(2026, 1, 2)
     containers = [
         SimpleNamespace(
@@ -507,6 +508,7 @@ def test_disk_quota_stop_marks_all_running_containers(monkeypatch):
 
 
 def test_worker_scheduler_expiry_and_cleanup_hold_gpu_lock(monkeypatch):
+    monkeypatch.setattr("app.scheduler.reject_shares_for_exit", lambda *args, **kwargs: None)
     from app import scheduler
 
     class Lock:

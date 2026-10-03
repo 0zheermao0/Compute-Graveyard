@@ -11,6 +11,8 @@ from app.config import (
     DEFAULT_IDLE_GPU_RECLAIM_ENABLED,
     DEFAULT_IDLE_GPU_UTIL_THRESHOLD_PERCENT,
     DEFAULT_MAX_GPU_SHARING_USERS,
+    MAX_LEASE_DAYS,
+    MAX_REPUTATION_SCORE,
 )
 from app.database_models import SystemSettings
 
@@ -24,6 +26,18 @@ class SettingsValues:
     idle_gpu_util_threshold_percent: int
     idle_gpu_memory_threshold_percent: int
     idle_gpu_duration_hours: int
+    idle_gpu_dual_low_enabled: bool = True
+    idle_gpu_memory_unchanged_enabled: bool = True
+    idle_gpu_shrink_enabled: bool = True
+    reputation_initial_score: int = 0
+    reputation_idle_warning_points: int = 1
+    reputation_idle_reclaim_points: int = 2
+    reputation_idle_shrink_points: int = 2
+    reputation_expiry_reward_points: int = 2
+    reputation_tier1_threshold: int = 5
+    reputation_tier1_max_days: int = 5
+    reputation_tier2_threshold: int = 10
+    reputation_tier2_max_days: int = 3
 
 
 def parse_bool(value, default: bool) -> bool:
@@ -41,6 +55,13 @@ def parse_bool(value, default: bool) -> bool:
 
 
 def validate_settings(values: SettingsValues) -> None:
+    for key, value in asdict(values).items():
+        if key.startswith("reputation_") and (type(value) is not int or not 0 <= value <= MAX_REPUTATION_SCORE):
+            raise ValueError(f"{key} 必须为 0~{MAX_REPUTATION_SCORE} 的整数")
+    if values.reputation_tier2_threshold <= values.reputation_tier1_threshold:
+        raise ValueError("信誉阈值必须递增")
+    if not 1 <= values.reputation_tier2_max_days <= values.reputation_tier1_max_days <= MAX_LEASE_DAYS:
+        raise ValueError(f"租期必须在 1~{MAX_LEASE_DAYS} 天且第二档不超过第一档")
     if values.cpu_mem_gb < 1:
         raise ValueError("CPU 内存配额最小 1 GB")
     if values.gpu_mem_gb_per_gpu < 1:
@@ -68,6 +89,11 @@ def load_settings(db) -> SettingsValues:
         idle_gpu_util_threshold_percent=int(rows.get("idle_gpu_util_threshold_percent", DEFAULT_IDLE_GPU_UTIL_THRESHOLD_PERCENT)),
         idle_gpu_memory_threshold_percent=int(rows.get("idle_gpu_memory_threshold_percent", DEFAULT_IDLE_GPU_MEMORY_THRESHOLD_PERCENT)),
         idle_gpu_duration_hours=int(rows.get("idle_gpu_duration_hours", DEFAULT_IDLE_GPU_DURATION_HOURS)),
+        idle_gpu_dual_low_enabled=parse_bool(rows.get("idle_gpu_dual_low_enabled"), True),
+        idle_gpu_memory_unchanged_enabled=parse_bool(rows.get("idle_gpu_memory_unchanged_enabled"), True),
+        idle_gpu_shrink_enabled=parse_bool(rows.get("idle_gpu_shrink_enabled"), True),
+        **{key: int(rows.get(key, field.default)) for key, field in SettingsValues.__dataclass_fields__.items()
+           if key.startswith("reputation_")},
     )
     validate_settings(values)
     return values
@@ -89,9 +115,13 @@ def save_settings(db, values: SettingsValues) -> SettingsValues:
 
 def idle_policy_signature(values: SettingsValues) -> str:
     payload = {
+        "algorithm": "window-v2",
         "enabled": values.idle_gpu_reclaim_enabled,
         "util": values.idle_gpu_util_threshold_percent,
         "memory": values.idle_gpu_memory_threshold_percent,
         "hours": values.idle_gpu_duration_hours,
+        "dual_low_enabled": values.idle_gpu_dual_low_enabled,
+        "memory_unchanged_enabled": values.idle_gpu_memory_unchanged_enabled,
+        "shrink_enabled": values.idle_gpu_shrink_enabled,
     }
     return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()

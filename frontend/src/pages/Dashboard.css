@@ -540,14 +540,6 @@
   background: rgba(0, 0, 0, 0.25);
 }
 
-.dashboard-nodes > h2 {
-  margin: 0 0 0.75rem;
-  color: var(--text-muted);
-  font-size: 0.75rem;
-  text-transform: uppercase;
-  letter-spacing: 0.06em;
-}
-
 .dashboard-node {
   margin-bottom: 1rem;
   padding: 1rem;
@@ -619,6 +611,10 @@
 @media (max-width: 1200px) {
   .dashboard-body {
     flex-direction: column;
+  }
+
+  .dashboard-main {
+    width: 100%;
   }
 
   .dashboard-sidebar {

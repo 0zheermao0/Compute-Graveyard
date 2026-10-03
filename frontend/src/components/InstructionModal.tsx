@@ -51,8 +51,8 @@ export default function InstructionModal({ onClose }: InstructionModalProps) {
                     </section>
 
                     <section className="ins-section">
-                        <h3><Activity size={18} /> 7. GPU 低利用率自动销毁</h3>
-                        <p>启用低利用率回收时，仅 GPU 容器受影响：分配的每张 GPU 的利用率和显存占用率均持续低于阈值（默认各 <strong>5%</strong>）满默认 <strong>24 小时</strong>，容器将自动停止并销毁；<code>/workspace</code> 数据保留。CPU 容器不受此规则影响，具体阈值和时长以管理员设置为准。</p>
+                        <h3><Activity size={18} /> 7. GPU 长时间低占用自动回收</h3>
+                        <p>启用自动回收后，GPU 长时间处于低占用状态的容器将被自动回收（默认 <strong>24 小时</strong>，具体以管理员设置为准）。回收前会发送预警，<code>/workspace</code> 中的数据会保留，CPU 容器不受影响。</p>
                     </section>
 
                     <div className="modal-hint" style={{ marginTop: '1.5rem', background: 'rgba(52, 211, 153, 0.1)', borderColor: 'rgba(52, 211, 153, 0.2)', color: '#34d399' }}>

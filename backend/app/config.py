@@ -16,6 +16,7 @@ SERVICE_PORT_END = int(os.getenv("SERVICE_PORT_END", "40000"))
 DOCKER_BASE_IMAGE = os.getenv("DOCKER_BASE_IMAGE", "nvidia/cuda:12.0-runtime-ubuntu22.04")
 DEFAULT_LEASE_DAYS = int(os.getenv("DEFAULT_LEASE_DAYS", "3"))
 MAX_LEASE_DAYS = int(os.getenv("MAX_LEASE_DAYS", "7"))
+MAX_REPUTATION_SCORE = 2**31 - 1
 MAX_GPUS_PER_USER = int(os.getenv("MAX_GPUS_PER_USER", "2"))
 MAX_CONTAINERS_PER_USER = int(os.getenv("MAX_CONTAINERS_PER_USER", "4"))
 # 内存配额默认值（单位 GB），可在管理后台动态覆盖
@@ -40,6 +41,12 @@ if DISK_QUOTA_GRACE_HOURS <= 0:
 JWT_SECRET = os.getenv("JWT_SECRET", "change-this-in-production")
 DATABASE_URL = os.getenv("DATABASE_URL", f"sqlite:///{DATA_DIR / 'lab_gpu.db'}")
 CORS_ORIGINS = [value.strip() for value in os.getenv("CORS_ORIGINS", "").split(",") if value.strip()]
+# Passkey 配置只能来自受信任的环境变量，不根据请求 Host/Origin 推断。
+WEBAUTHN_RP_ID = os.getenv("WEBAUTHN_RP_ID", "").strip().lower() or "localhost"
+WEBAUTHN_RP_NAME = os.getenv("WEBAUTHN_RP_NAME", "").strip() or "Compute Graveyard"
+WEBAUTHN_ORIGINS = [
+    value.strip() for value in os.getenv("WEBAUTHN_ORIGINS", "").split(",") if value.strip()
+] or [f"http://localhost:{port}" for port in (5173, 3000, 8000, 8099)]
 NOTIFY_WEBHOOK = os.getenv("NOTIFY_WEBHOOK", "")  # 钉钉/飞书 Webhook
 INITIAL_ADMIN_USERNAME = os.getenv("INITIAL_ADMIN_USERNAME", "admin").strip().lower()
 INITIAL_ADMIN_PASSWORD = os.getenv("INITIAL_ADMIN_PASSWORD", "")

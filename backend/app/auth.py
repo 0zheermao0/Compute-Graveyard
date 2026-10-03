@@ -4,7 +4,7 @@ from typing import Optional
 
 from jose import JWTError, jwt
 from passlib.context import CryptContext
-from fastapi import Depends, HTTPException, status
+from fastapi import Depends, HTTPException
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 
 from app.config import JWT_SECRET
@@ -40,7 +40,8 @@ def decode_token(token: str) -> Optional[dict]:
         return None
 
 
-async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security), db=Depends(get_db)):
+# 同步 SQLAlchemy 查询必须由 FastAPI 在线程池中执行，不能阻塞事件循环等连接。
+def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security), db=Depends(get_db)):
     from app.database_models import UserModel
 
     if not credentials:
@@ -56,7 +57,7 @@ async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(s
     return user
 
 
-async def get_current_admin(user=Depends(get_current_user)):
+def get_current_admin(user=Depends(get_current_user)):
     if user.role != "admin":
         raise HTTPException(status_code=403, detail="需要管理员权限")
     return user

@@ -1,5 +1,6 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { fetcher } from "../api/client";
+import { fetchApplicationPolicy, type ApplicationPolicy } from "../api/applicationPolicy";
 import type { DashboardNode } from "../pages/Dashboard";
 import "./ApplyModal.css";
 
@@ -93,6 +94,7 @@ export default function ApplyModal({ gpuSharing, nodes, isMaster, onClose, onSuc
   const localNode = nodes.find((node) => node.is_local);
   const defaultMode: PlacementMode = "local";
   const [applyMode, setApplyMode] = useState<ApplyMode>("new");
+  const applyModeChanged = useRef(false);
   const [targets, setTargets] = useState<MergeTarget[]>([]);
   const [targetsLoading, setTargetsLoading] = useState(true);
   const [targetsError, setTargetsError] = useState("");
@@ -100,6 +102,26 @@ export default function ApplyModal({ gpuSharing, nodes, isMaster, onClose, onSuc
   const [cpuOnly, setCpuOnly] = useState(false);
   const [selected, setSelected] = useState<number[]>([]);
   const [leaseDays, setLeaseDays] = useState(3);
+  const [policy, setPolicy] = useState<ApplicationPolicy | null>(null);
+  const [policyError, setPolicyError] = useState("");
+  const [policyAttempt, setPolicyAttempt] = useState(0);
+  const maxLeaseDays = policy ? (cpuOnly ? policy.cpu_max_lease_days : policy.gpu_max_lease_days) : 0;
+
+  useEffect(() => {
+    let active = true;
+    setPolicy(null);
+    setPolicyError("");
+    fetchApplicationPolicy().then((values) => {
+      if (active) setPolicy(values);
+    }).catch(() => {
+      if (active) setPolicyError("使用期限加载失败，请重试");
+    });
+    return () => { active = false; };
+  }, [policyAttempt]);
+
+  useEffect(() => {
+    if (maxLeaseDays > 0) setLeaseDays((days) => Math.min(days, maxLeaseDays));
+  }, [maxLeaseDays]);
   const [placementMode, setPlacementMode] = useState<PlacementMode>(defaultMode);
   const [nodeId, setNodeId] = useState("");
   const [modeExpanded, setModeExpanded] = useState(false);
@@ -146,7 +168,15 @@ export default function ApplyModal({ gpuSharing, nodes, isMaster, onClose, onSuc
   useEffect(() => {
     let active = true;
     fetcher<MergeTarget[]>("/containers/my").then((containers) => {
-      if (active) setTargets(containers);
+      if (!active) return;
+      setTargets(containers);
+      if (containers.length > 0 && !applyModeChanged.current) {
+        setApplyMode("merge");
+        setSelected([]);
+        setCpuOnly(false);
+        setError("");
+        setNodeExpanded(true);
+      }
     }).catch((e) => {
       if (active) setTargetsError(e instanceof Error ? e.message : "加载已有容器失败");
     }).finally(() => {
@@ -224,6 +254,7 @@ export default function ApplyModal({ gpuSharing, nodes, isMaster, onClose, onSuc
   }, [gpuSharing, localNode, nodeId, nodes, effectivePlacement, selected, merging, isMaster, targetNode, target?.gpu_ids, targetNodeId, targets]);
 
   const setMode = (mode: ApplyMode) => {
+    applyModeChanged.current = true;
     if (mode !== applyMode) {
       setApplyMode(mode);
       setTargetId(null);
@@ -256,6 +287,10 @@ export default function ApplyModal({ gpuSharing, nodes, isMaster, onClose, onSuc
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (!policy || (!merging && (leaseDays < 1 || leaseDays > maxLeaseDays))) {
+      setError("请加载使用期限并选择有效天数");
+      return;
+    }
     if (localUnavailable) {
       setError(isMaster ? "本机节点当前不可用，请选择自动调度或其他节点" : "本机节点当前不可用，暂无法申请容器");
       return;
@@ -311,6 +346,14 @@ export default function ApplyModal({ gpuSharing, nodes, isMaster, onClose, onSuc
       });
     } catch (e) {
       setError(e instanceof Error ? e.message : "申请失败");
+      // Refresh available durations if policy changed while the dialog was open.
+      try {
+        setPolicy(await fetchApplicationPolicy());
+        setPolicyError("");
+      } catch {
+        setPolicy(null);
+        setPolicyError("使用期限加载失败，请重试");
+      }
     } finally {
       setLoading(false);
     }
@@ -400,7 +443,7 @@ export default function ApplyModal({ gpuSharing, nodes, isMaster, onClose, onSuc
   }
 
   const hasAnyGpu = gpuChoices.length > 0;
-  const submitDisabled = loading || localUnavailable || (merging && (targetsLoading || !target || !targetNode?.online || !targetNode.schedulable)) || (effectivePlacement === "specific" && !effectiveNodeId) || ((merging || !cpuOnly) && (!hasAnyGpu || selected.length === 0 || selected.some((id) => !gpuChoices.find((choice) => choice.index === id && choice.selectable))));
+  const submitDisabled = loading || !policy || (!merging && leaseDays > maxLeaseDays) || localUnavailable || (merging && (targetsLoading || !target || !targetNode?.online || !targetNode.schedulable)) || (effectivePlacement === "specific" && !effectiveNodeId) || ((merging || !cpuOnly) && (!hasAnyGpu || selected.length === 0 || selected.some((id) => !gpuChoices.find((choice) => choice.index === id && choice.selectable))));
   const availableGpuCount = gpuChoices.filter((choice) => choice.selectable).length;
   const placementSummary = merging ? targetNode?.node_name || target?.node_name || "待选择容器" : effectivePlacement === "auto" ? "自动调度" : effectivePlacement === "local" ? localNode?.node_name || "本机节点" : nodes.find((node) => node.node_id === nodeId)?.node_name || "待选择节点";
 
@@ -463,8 +506,9 @@ export default function ApplyModal({ gpuSharing, nodes, isMaster, onClose, onSuc
               </div>
             </div>}
           </section>
-          {!merging && <section className="apply-section" aria-labelledby="apply-lease-title"><div className="apply-section-heading"><span className="apply-step">{isMaster ? "04" : "03"}</span><div><h3 id="apply-lease-title">使用期限</h3><p>选择容器租期，最长 7 天。</p></div></div><div className="lease-days-row" role="group" aria-label="选择租期">{[1, 2, 3, 4, 5, 6, 7].map((day) => <button key={day} type="button" aria-pressed={leaseDays === day} className={`lease-day-btn ${leaseDays === day ? "active" : ""}`} onClick={() => setLeaseDays(day)}>{day} 天</button>)}</div></section>}
-          <div className="apply-summary"><span>申请概览</span><strong>{placementSummary} · {merging || !cpuOnly ? `${selected.length} 块 GPU` : "纯 CPU"}{!merging && ` · ${leaseDays} 天`}</strong></div>
+          {!merging && <section className="apply-section" aria-labelledby="apply-lease-title"><div className="apply-section-heading"><span className="apply-step">{isMaster ? "04" : "03"}</span><div><h3 id="apply-lease-title">使用期限</h3><p>{policy ? `选择容器租期，最长 ${maxLeaseDays} 天。` : policyError ? "暂无法加载使用期限。" : "正在加载使用期限…"}</p></div></div><div className="lease-days-row" role="group" aria-label="选择租期">{Array.from({ length: maxLeaseDays }, (_, index) => index + 1).map((day) => <button key={day} type="button" aria-pressed={leaseDays === day} className={`lease-day-btn ${leaseDays === day ? "active" : ""}`} onClick={() => setLeaseDays(day)}>{day} 天</button>)}</div></section>}
+          {policyError && <div className="form-error" role="alert">{policyError} <button type="button" className="btn btn-ghost" onClick={() => setPolicyAttempt((attempt) => attempt + 1)}>重试</button></div>}
+          <div className="apply-summary"><span>申请概览</span><strong>{placementSummary} · {merging || !cpuOnly ? `${selected.length} 块 GPU` : "纯 CPU"}{!merging && (policy ? ` · ${Math.min(leaseDays, maxLeaseDays)} 天` : " · 期限待加载")}</strong></div>
           {!merging && <p className="modal-hint apply-footnote">SSH 与常用端口随机映射，密码自动分配；个人目录挂载至 /workspace</p>}
           {error && <div className="form-error" role="alert">{error}</div>}
           <div className="modal-actions"><button type="button" className="btn" onClick={handleClose}>取消</button><button type="submit" className="btn btn-primary" disabled={submitDisabled} aria-busy={loading}>{loading ? "申请中…" : merging ? "确认合并 GPU" : "确认申请"}</button></div>

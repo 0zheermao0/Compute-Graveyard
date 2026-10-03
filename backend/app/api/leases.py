@@ -8,6 +8,7 @@ from app.database import get_db
 from app.database_models import ContainerModel, LeaseRecordModel
 from app.models import LeaseRenewRequest
 from app.config import MAX_LEASE_DAYS
+from app.reputation_service import enforce_lease
 
 router = APIRouter()
 
@@ -35,9 +36,8 @@ def renew_lease(container_id: int, req: LeaseRenewRequest, user=Depends(get_curr
             detail=f"仅在到期前 {RENEW_WINDOW_HOURS} 小时内可申请续租",
         )
 
-    days = min(req.lease_days, MAX_LEASE_DAYS)
-    if days < 1:
-        days = 1
+    days = req.lease_days if c.gpu_ids else max(1, min(req.lease_days, MAX_LEASE_DAYS))
+    enforce_lease(db, user, days, gpu=bool(c.gpu_ids))
 
     new_expires = c.expires_at + timedelta(days=days)
     c.expires_at = new_expires
